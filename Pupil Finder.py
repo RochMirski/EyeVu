@@ -5,6 +5,10 @@ from skimage.measure import label
 from skimage.color import label2rgb
 import cv2
 from mpl_toolkits.mplot3d import Axes3D
+from EyeTracking.EyeTracker.OrloskyPupilDetector import crop_to_aspect_ratio, get_darkest_area, apply_binary_threshold, mask_outside_square, process_frames
+import os
+import time
+"""
 print(cv2.__version__)
 # Replace 'default_image.jpg' with your actual default image filename
 image_path = 'Images\default_image.jpg'
@@ -273,4 +277,103 @@ if circles is not None:
     plt.figure(figsize=(6, 6))
     plt.imshow(arr)
     plt.title('Arrow: Image Center to Largest Circle Center')
-    plt.axis('off')
+    plt.axis('off')"""
+
+if __name__ == "__main__":
+    print(cv2.__version__)
+    images_folder = 'Images'
+    image_files = [f for f in os.listdir(images_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))]
+
+    for image_file in image_files:
+        image_path = r'Images\\' + image_file
+
+        #image_path = r'Images\default_image2.jpg'
+        cv2.destroyAllWindows()
+        # Open the image
+        img = cv2.imread(image_path)
+        cv2.imshow('Input Image', img)
+        cv2.waitKey(1)  # Add this line to ensure the window is displayed
+        
+        frame = img.copy()
+        debug_mode_on = True
+        # Crop and resize frame
+        #input("Press Enter to process this image...")
+        frame = crop_to_aspect_ratio(frame, frame.shape[1], frame.shape[0])
+
+        #find the darkest point
+        darkest_point = get_darkest_area(frame)
+
+        """if debug_mode_on:
+            darkest_image = frame.copy()
+            cv2.circle(darkest_image, darkest_point, 10, (0, 0, 255), -1)
+            cv2.imshow('Darkest image patch', darkest_image)"""
+
+        # Convert to grayscale to handle pixel value operations
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        darkest_pixel_value = gray_frame[darkest_point[1], darkest_point[0]]
+
+        # apply thresholding operations at different levels
+        # at least one should give us a good ellipse segment
+        thresholded_image_strict = apply_binary_threshold(gray_frame, darkest_pixel_value, 5)#lite
+        thresholded_image_strict = mask_outside_square(thresholded_image_strict, darkest_point, 250)
+
+        thresholded_image_medium = apply_binary_threshold(gray_frame, darkest_pixel_value, 15)#medium
+        thresholded_image_medium = mask_outside_square(thresholded_image_medium, darkest_point, 250)
+
+        thresholded_image_relaxed = apply_binary_threshold(gray_frame, darkest_pixel_value, 25)#heavy
+        thresholded_image_relaxed = mask_outside_square(thresholded_image_relaxed, darkest_point, 250)
+
+        #take the three images thresholded at different levels and process them
+        pupil_rotated_rect, centre_x, centre_y = process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, True)
+        # Calculate px_per_mm assuming the pupil's smallest diameter is 2mm
+        # pupil_rotated_rect[1] gives (width, height); take the smaller as the pupil diameter in px
+        pupil_diameter_px = min(pupil_rotated_rect[1])
+        px_per_mm = pupil_diameter_px / 4.0
+        print(f"Pixels per mm: {px_per_mm:.2f} px/mm")
+        # Calculate the vector from the image center to (centre_x, centre_y)
+        image_center = (frame.shape[1] // 2, frame.shape[0] // 2)
+        vector = (centre_x - image_center[0], centre_y - image_center[1])
+        print(f"Vector from image center to pupil center: {vector}")
+        # Draw the vector from image center to pupil center
+        output_img = frame.copy()
+        #cv2.destroyAllWindows()
+        # Draw the detected ellipse (pupil) on the output image
+        cv2.ellipse(output_img, pupil_rotated_rect, (255, 255, 0), 2)
+        # Draw the arrowed line from image center to pupil center
+        cv2.arrowedLine(
+            output_img,
+            image_center,
+            (int(centre_x), int(centre_y)),
+            (0, 0, 255),
+            3,
+            tipLength=0.2
+        )
+        # Draw the pupil center and image center for clarity
+        cv2.circle(output_img, (int(centre_x), int(centre_y)), 6, (0, 255, 0), -1)
+        cv2.circle(output_img, image_center, 6, (255, 0, 0), -1)
+
+        cv2.imshow("Vector from Image Center to Pupil Center", output_img)
+        cv2.waitKey(1)  # Add this line to ensure the window is displayed
+        # Calculate the physical length of the arrowed line in mm
+        arrow_length_px = np.linalg.norm(np.array(vector))
+        arrow_length_px = np.linalg.norm(np.array(vector))
+        arrow_length_mm = arrow_length_px / px_per_mm
+        print(f"Physical length of the arrowed line: {arrow_length_mm:.2f} mm")
+
+        # Normalize the arrowed line (vector) components to range 0-255
+        vector = np.array((int(centre_x), int(centre_y))) - np.array(image_center)
+        norm_x = int(255 * abs(vector[0]) / (px_per_mm*4))
+        norm_y = int(255 * abs(vector[1]) / (px_per_mm*4))
+        norm_x = min(norm_x, 255)
+        norm_y = min(norm_y, 255)
+
+        # Determine direction
+        x_dir = "right" if vector[0] > 0 else "left"
+        y_dir = "down" if vector[1] > 0 else "up"
+
+        print(f"X component: {norm_x} ({x_dir})")
+        print(f"Y component: {norm_y} ({y_dir})")
+
+
+        input("Press Enter to continue to the next image...")
+        
