@@ -82,6 +82,27 @@ def angular_eye_pos(theta, D, x_cent):
    y = -D/2 * np.sin(theta)
    return x, y
 
+def plot_angled_line(x_end, angle_deg, length, **kwargs):
+    """
+    Plot a line ending at x_end with a given angle (in degrees) and length.
+    Negative angle means negative gradient (sloping downward to the right).
+    
+    Parameters:
+    x_end (float): The x-coordinate where the line ends
+    angle_deg (float): The angle in degrees to the horizontal (negative for downward slope)
+    length (float): The length of the line
+    **kwargs: Additional arguments passed to plt.plot (e.g., color, linestyle)
+    """
+    ax = kwargs.pop('ax', plt.gca())
+    angle_rad = np.radians(angle_deg)
+    
+    # Calculate start point from end point
+    x_start = x_end - length * np.cos(angle_rad)
+    y_end = 0  # Line ends at y=0 on the lens plane
+    y_start = y_end - length * np.sin(angle_rad)
+    
+    ax.plot([x_start, x_end], [y_start, y_end], **kwargs)
+
 """FOV = 15
 lenses = [f_e, f_m, f_c]
 separations = [L_1, L, L_c]
@@ -113,7 +134,7 @@ def single_ray_plot(h_e1, lenses, separations, first_coord):
         next_y =  next_y + grad * separations[i]
 
         points.append([next_x, next_y])
-    print(points)
+    #print(points)
 
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
@@ -163,8 +184,11 @@ class OpticsCalcApp:
             'D': 24,
             'L_1': 40,
             'FOV': 4.6,
+            'FOV_set2': 4.6,
             'h_e1_ray1': 0.4,
-            'h_e1_ray2': -0.95
+            'h_e1_ray2': -0.95,
+            'h_e1_ray3_set2': 0.2,
+            'h_e1_ray4_set2': -0.5
         }
         self.sliders = {}
         self.create_widgets()
@@ -182,12 +206,15 @@ class OpticsCalcApp:
             ('x_1', -20, 20, 0.1),
             ('L_c', 1, 50, 0.1),
             ('a', 0.1, 10, 0.01),
-            ('L', 1, 200, 0.1),
+            ('L', 1, 500, 0.1),
             ('D', 1, 50, 0.1),
-            ('L_1', 1, 50, 0.1),
+            ('L_1', 1, 300, 0.1),
             ('FOV', 1, 90, 0.1),
             ('h_e1_ray1', -5, 5, 0.01),
-            ('h_e1_ray2', -5, 5, 0.01)
+            ('h_e1_ray2', -5, 5, 0.01),
+            ('FOV_set2', 1, 90, 0.1),
+            ('h_e1_ray3_set2', -5, 5, 0.01),
+            ('h_e1_ray4_set2', -5, 5, 0.01)
         ]
         for i, (name, minv, maxv, res) in enumerate(slider_specs):
             label = tk.Label(sliders_frame, text=name)
@@ -225,31 +252,56 @@ class OpticsCalcApp:
         D = self.params['D']
         L_1 = self.params['L_1']
         FOV = self.params['FOV']
+        FOV_set2 = self.params['FOV_set2']
         h_e1_ray1 = self.params['h_e1_ray1']
         h_e1_ray2 = self.params['h_e1_ray2']
         h_e1_ray3 = (h_e1_ray1 + h_e1_ray2) / 2
+        h_e1_ray3_set2 = self.params['h_e1_ray3_set2']
+        h_e1_ray4_set2 = self.params['h_e1_ray4_set2']
+        h_e1_ray5_set2 = (h_e1_ray3_set2 + h_e1_ray4_set2) / 2
 
         x_cent = -f_e + D/2
         lenses = [f_e, f_m, f_c]
         separations = [L_1, L, L_c]
+        
+        # Set 1: Calculate eye position from FOV
         ang = half_angle_theta_from_FOV(FOV, D)
         first_coord = angular_eye_pos(half_angle_theta_from_FOV(FOV, D), D, x_cent)
         self.ax.scatter(first_coord[0], first_coord[1], color='k', label='Eye')
 
-        # Ray 1
+        # Set 1: Ray 1
         xs1, ys1 = single_ray_plot(h_e1_ray1, lenses, separations, first_coord)
         self.ax.plot(xs1, ys1, label='Ray 1')
-        # Ray 2
+        # Set 1: Ray 2
         xs2, ys2 = single_ray_plot(h_e1_ray2, lenses, separations, first_coord)
         self.ax.plot(xs2, ys2, 'r', label='Ray 2')
-        # Ray 3 (average)
+        # Set 1: Ray 3 (average)
         xs3, ys3 = single_ray_plot(h_e1_ray3, lenses, separations, first_coord)
         self.ax.plot(xs3, ys3, 'g', label='Ray 3 (avg)')
+
+        # Set 2: Calculate eye position from FOV_set2
+        first_coord_set2 = angular_eye_pos(half_angle_theta_from_FOV(FOV_set2, D), D, x_cent)
+        # Set 2: Ray 3
+        xs4, ys4 = single_ray_plot(h_e1_ray3_set2, lenses, separations, first_coord_set2)
+        self.ax.plot(xs4, ys4, 'orange', label='Ray 3 (Set 2)')
+        # Set 2: Ray 4
+        xs5, ys5 = single_ray_plot(h_e1_ray4_set2, lenses, separations, first_coord_set2)
+        self.ax.plot(xs5, ys5, 'purple', label='Ray 4 (Set 2)')
+        # Set 2: Ray 5 (average)
+        xs6, ys6 = single_ray_plot(h_e1_ray5_set2, lenses, separations, first_coord_set2)
+        self.ax.plot(xs6, ys6, 'brown', label='Ray 5 (avg Set 2)')
 
         # Vertical lines
         heights = [0, 12, 60, 10, a]
         for i in range(0, len(lenses)+2):
             plot_vertical_line([xs1, xs2, xs3][0][i], heights[i], ax=self.ax)
+
+        # Angled lines ending on final lens plane
+        final_x = xs1[-1]  # Final (last) plane position
+        prev_x = xs1[-2]   # Previous plane position
+        line_length = final_x - prev_x + 10  # Extend to previous plane with margin
+        plot_angled_line(final_x, -41/2, line_length, color='blue', linestyle='--', label='Line -20.5°', ax=self.ax)
+        plot_angled_line(final_x, -66/2, line_length, color='purple', linestyle='--', label='Line -33°', ax=self.ax)
 
         # Circle
         plot_circle(x_cent, 0, D, ax=self.ax)
@@ -270,8 +322,8 @@ class OpticsCalcApp:
         else:
             self.ax.set_aspect('equal', adjustable='datalim')
             # Set limits to fit all rays and circle
-            all_xs = xs1 + xs2 + xs3 + [x_cent, x_1]
-            all_ys = ys1 + ys2 + ys3 + [p/2, -p/2, 0]
+            all_xs = xs1 + xs2 + xs3 + xs4 + xs5 + xs6 + [x_cent, x_1]
+            all_ys = ys1 + ys2 + ys3 + ys4 + ys5 + ys6 + [p/2, -p/2, 0]
             margin = 0.1 * max(D, L, L_1)
             self.ax.set_xlim(min(all_xs)-margin, max(all_xs)+margin)
             self.ax.set_ylim(min(all_ys)-margin, max(all_ys)+margin)
