@@ -279,6 +279,8 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
 def process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, render_cv_window):
   
     final_rotated_rect = ((0,0),(0,0),0)
+    center_x = frame.shape[1] // 2  # default: image centre
+    center_y = frame.shape[0] // 2
 
     image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict] #holds images
     name_array = ["relaxed", "medium", "strict"] #for naming windows
@@ -340,13 +342,14 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
             final_image = dilated_image
     
     if debug_mode_on:
-        cv2.imshow("Reduced contours of best thresholded image", ellipse_reduced_contours)
+        if isinstance(ellipse_reduced_contours, np.ndarray) and ellipse_reduced_contours.size > 0:
+            cv2.imshow("Reduced contours of best thresholded image", ellipse_reduced_contours)
 
     test_frame = frame.copy()
     
     final_contours = [optimize_contours_by_angle(final_contours, gray_frame)]
     
-    if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0] > 5):
+    if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0]) > 5:
         #cv2.drawContours(test_frame, final_contours, -1, (255, 255, 255), 1)
         ellipse = cv2.fitEllipse(final_contours[0])
         final_rotated_rect = ellipse
@@ -370,6 +373,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         cv2.ellipse(gray_frame, ellipse, (255,255,255), 2)  # Draw with white color and thickness of 2
 
     #process_frames now returns a rotated rectangle for the ellipse for easy access
+    # center_x/center_y default to frame centre if no ellipse was found
     return final_rotated_rect, center_x, center_y
 
 
