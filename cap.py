@@ -61,7 +61,8 @@ except ImportError:
 
 # ───────── CONFIG ─────────
 
-LED_PIN = 17
+LED_PIN  = 17
+LED_PIN_2 = 27
 
 PHOTO_PATH = "/tmp/retina_preview.jpg"
 
@@ -91,6 +92,10 @@ FLASH2_DURATION = 0.075
 BRIGHTNESS = 2.0
 CONTRAST = 1.0
 
+# ROI zoom: CROP_MARGIN multiplies the detected high-contrast region size
+# (1.0 = exact fit to region, 1.5 = 50% padding around it)
+CROP_MARGIN = 1.5
+
 # Rotation (index into ROTATION_* tables below)
 # 0=none, 1=90°CCW, 2=180°, 3=90°CW
 LIVE_ROTATION = 1
@@ -118,9 +123,11 @@ def setup_gpio():
 
     GPIO.setwarnings(False)
 
-    GPIO.setup(LED_PIN, GPIO.OUT)
+    GPIO.setup(LED_PIN,  GPIO.OUT)
+    GPIO.setup(LED_PIN_2, GPIO.OUT)
 
-    GPIO.output(LED_PIN, GPIO.LOW)
+    GPIO.output(LED_PIN,  GPIO.LOW)
+    GPIO.output(LED_PIN_2, GPIO.LOW)
 
 
 def cleanup_gpio():
@@ -128,7 +135,8 @@ def cleanup_gpio():
     if not GPIO_AVAILABLE:
         return
 
-    GPIO.output(LED_PIN, GPIO.LOW)
+    GPIO.output(LED_PIN,  GPIO.LOW)
+    GPIO.output(LED_PIN_2, GPIO.LOW)
 
     GPIO.cleanup()
 
@@ -136,13 +144,15 @@ def cleanup_gpio():
 def flash_on():
 
     if GPIO_AVAILABLE:
-        GPIO.output(LED_PIN, GPIO.HIGH)
+        GPIO.output(LED_PIN,  GPIO.HIGH)
+        GPIO.output(LED_PIN_2, GPIO.HIGH)
 
 
 def flash_off():
 
     if GPIO_AVAILABLE:
-        GPIO.output(LED_PIN, GPIO.LOW)
+        GPIO.output(LED_PIN,  GPIO.LOW)
+        GPIO.output(LED_PIN_2, GPIO.LOW)
 
 
 def apply_camera_settings(picam2, gain):
@@ -189,6 +199,10 @@ def print_settings():
 
     print(f"brightness         = {BRIGHTNESS}")
     print(f"contrast           = {CONTRAST}")
+
+    print()
+
+    print(f"crop_margin        = {CROP_MARGIN}")
 
     print("────────────────────────\n")
 
@@ -310,18 +324,53 @@ def capture_image(picam2):
 
     time.sleep(0.02)
 
-    # ───────── FIRST FLASH ─────────
+    # ───────── FIRST FLASH (pupil constriction) ─────────
+    # Capture a baseline frame (pupil dilated, ambient light only), fire the
+    # flash, then capture again after constriction peaks.  The region that
+    # changed most is where the pupil boundary moved — use it as the crop ROI.
+
+    array_before = picam2.capture_array()
 
     flash_on()
-
     time.sleep(FLASH1_DURATION)
-
     flash_off()
 
-    # Gap between flashes
-    time.sleep(FLASH_GAP)
+    # Wait for pupil constriction to peak (~0.5–0.8 s post-flash)
+    _CONSTRICT_DELAY = 0.7
+    time.sleep(_CONSTRICT_DELAY)
 
-    # ───────── SECOND FLASH ─────────
+    array_after = picam2.capture_array()
+
+    # Derive ROI from the change between frames; fall back to streaming estimate
+    # (CROPPING DISABLED)
+    # _roi_crop_applied = False
+    # if CV2_AVAILABLE:
+    #     frame_before = cv2.cvtColor(array_before, cv2.COLOR_RGB2BGR)
+    #     frame_after  = cv2.cvtColor(array_after,  cv2.COLOR_RGB2BGR)
+    #     roi = _find_change_roi(frame_before, frame_after)
+    #     if roi is None:
+    #         roi = _last_roi
+    # else:
+    #     roi = _last_roi
+    # if roi is not None:
+    #     rx, ry, rw, rh = roi
+    #     sx = 3280 / CAMERA_WIDTH                # ≈ 2.5625
+    #     sy = 2464 / CAMERA_HEIGHT               # ≈ 2.5667
+    #     scaler_crop = (
+    #         int(rx * sx),
+    #         int(ry * sy),
+    #         int(rw * sx),
+    #         int(rh * sy),
+    #     )
+    #     picam2.set_controls({"ScalerCrop": scaler_crop})
+    #     print(f"ROI zoom applied: sensor crop {scaler_crop}")
+    #     _roi_crop_applied = True
+
+    # Wait out the remainder of the inter-flash gap
+    elapsed = FLASH1_DURATION + _CONSTRICT_DELAY
+    time.sleep(max(0.0, FLASH_GAP - elapsed))
+
+    # ───────── SECOND FLASH (main capture) ─────────
 
     flash_on()
 
@@ -342,6 +391,10 @@ def capture_image(picam2):
         LIVE_GAIN
     )
 
+    # Restore full-frame sensor crop (CROPPING DISABLED)
+    # if _roi_crop_applied:
+    #     picam2.set_controls({"ScalerCrop": (0, 0, 3280, 2464)})
+
     # Process image
     img = process_image(array)
 
@@ -351,7 +404,15 @@ def capture_image(picam2):
     print("Captured.")
 
 
-# ── Volcano / concentric-ring detection ─────────────────────────────────────
+# ── Overlay helpers ──────────────────────────────────────────────────────────
+# Only recompute live overlay every N frames
+_LIVE_OVERLAY_SKIP = 5
+# Last detected high-contrast ROI (x, y, w, h) in camera-frame coordinates.
+# Updated periodically in streaming_mode; used by capture_image for ScalerCrop.
+_last_roi = None
+
+# ── Volcano / concentric-ring detection (disabled) ───────────────────────────
+'''
 _V_LOCAL_KERNEL   = 50
 _V_MIN_CONTRAST   = 0.10
 _V_MAX_RIM_R      = 220
@@ -361,13 +422,35 @@ _V_CENTRE_TOL     = 55
 _V_RING_SIZE_TOL  = 0.50
 _V_SPECULAR_PCT   = 99.0
 _V_INPAINT_R      = 7
-# Live-feed performance: smaller search radius + only recompute every N frames
 _V_LIVE_MAX_RIM_R = 100
-_LIVE_OVERLAY_SKIP = 5
+_V_ROI_SIZE = 350
 
 _V_PIT_COL   = (0,   255, 255)   # yellow  — pit edge
 _V_RIM_COL   = (255,   0, 255)   # magenta — rim
 _V_PEAK_COL  = (0,   165, 255)   # orange  — peak-volcano
+
+
+def _find_roi(img, cx_hint=None, cy_hint=None):
+    """Return (x1, y1, x2, y2) of a _V_ROI_SIZE square.
+    If cx_hint/cy_hint are provided (e.g. from the Purkinje reflection) centre
+    there directly; otherwise fall back to the brightest region of img."""
+    h, w = img.shape[:2]
+    half  = _V_ROI_SIZE // 2
+    if cx_hint is not None and cy_hint is not None:
+        cx, cy = cx_hint, cy_hint
+    else:
+        gray = np.max(img, axis=2).astype(np.float32)
+        blur = cv2.GaussianBlur(gray, (101, 101), 0)
+        _, _, _, max_loc = cv2.minMaxLoc(blur)
+        cx, cy = max_loc
+    x1 = max(0, cx - half)
+    y1 = max(0, cy - half)
+    x2 = min(w, x1 + _V_ROI_SIZE)
+    y2 = min(h, y1 + _V_ROI_SIZE)
+    # Shift back if clipped at right/bottom edge
+    x1 = max(0, x2 - _V_ROI_SIZE)
+    y1 = max(0, y2 - _V_ROI_SIZE)
+    return x1, y1, x2, y2
 
 
 def _v_radial_profile(smooth, cx, cy, max_r):
@@ -455,8 +538,14 @@ def _volcano_overlay(frame, live=False):
     """Detect peak-type concentric rings (orange+magenta) in blue/red channels,
     match them, and fall back to green peaks if no match.  Returns annotated BGR
     frame.  Replaces _pupil_overlay / _focus_overlay."""
+    print("Detecting volcanoes...")
     mr = _V_LIVE_MAX_RIM_R if live else _V_MAX_RIM_R
     img_h, img_w = frame.shape[:2]
+
+    # Use the Purkinje reflection as the ROI centre (more precise than blur peak)
+    purkinje   = _detect_reflex(frame)
+    cx_hint    = purkinje[0] if purkinje else None
+    cy_hint    = purkinje[1] if purkinje else None
 
     # Inpaint specular (Purkinje) reflection
     spec_max  = np.max(frame, axis=2)
@@ -466,13 +555,27 @@ def _volcano_overlay(frame, live=False):
                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
     img = cv2.inpaint(frame, spec_mask, _V_INPAINT_R, cv2.INPAINT_TELEA)
 
-    canvas     = frame.copy()
-    blue_vs    = _v_find_volcanos(img[:, :, 0], img_h, img_w, mr)
-    red_vs     = _v_find_volcanos(img[:, :, 2], img_h, img_w, mr)
+    # Restrict search to a box centred on the Purkinje spot (or brightest region)
+    roi_x1, roi_y1, roi_x2, roi_y2 = _find_roi(img, cx_hint, cy_hint)
+    roi = img[roi_y1:roi_y2, roi_x1:roi_x2]
+    roi_h, roi_w = roi.shape[:2]
+
+    def _off(vs):
+        """Offset ROI-relative coordinates back to full-frame space."""
+        return [{**v, 'cx': v['cx'] + roi_x1, 'cy': v['cy'] + roi_y1} for v in vs]
+
+    canvas = frame.copy()
+    # Draw ROI box so it's visible in the saved image
+    cv2.rectangle(canvas, (roi_x1, roi_y1), (roi_x2, roi_y2), (80, 80, 80), 1)
+    print("Detecting Blue volcanoes...")
+    blue_vs    = _off(_v_find_volcanos(roi[:, :, 0], roi_h, roi_w, mr))
+    print("Detecting Red volcanoes...")
+    red_vs     = _off(_v_find_volcanos(roi[:, :, 2], roi_h, roi_w, mr))
     blue_peaks = [v for v in blue_vs if _v_has_two_rings(v) and v['kind'] == 'peak']
     red_peaks  = [v for v in red_vs  if _v_has_two_rings(v) and v['kind'] == 'peak']
 
     matches = []
+    print(f"Matching {len(blue_peaks)} blue peaks with {len(red_peaks)} red peaks...")
     for bv in blue_peaks:
         for rv in red_peaks:
             if np.hypot(bv['cx'] - rv['cx'], bv['cy'] - rv['cy']) > _V_CENTRE_TOL:
@@ -485,6 +588,7 @@ def _volcano_overlay(frame, live=False):
                 matches.append((bv, rv))
 
     if matches:
+        print("Plotting volcanoes...")
         for bv, rv in matches:
             cx  = (bv['cx']    + rv['cx'])    // 2
             cy  = (bv['cy']    + rv['cy'])    // 2
@@ -503,12 +607,150 @@ def _volcano_overlay(frame, live=False):
     else:
         _v_draw(canvas, blue_peaks)
         _v_draw(canvas, red_peaks)
-        green_vs    = _v_find_volcanos(img[:, :, 1], img_h, img_w, mr)
+        green_vs    = _off(_v_find_volcanos(roi[:, :, 1], roi_h, roi_w, mr))
         green_peaks = [v for v in green_vs
                        if _v_has_two_rings(v) and v['kind'] == 'peak']
         _v_draw(canvas, green_peaks)
 
     return canvas
+'''
+
+
+def _find_contrast_roi(frame):
+    """Find the region where very bright and very dark areas coexist in the
+    blue/green channels.  This highlights the pupil boundary and Purkinje
+    reflex area while suppressing the red fundus glow.
+
+    Returns (x, y, w, h) as a square in frame coordinates, or None.
+    CROP_MARGIN multiplies the detected region size before returning.
+    """
+    h, w = frame.shape[:2]
+
+    # Blue + green only (channel 0 and 1 in BGR) — ignores red fundus glow
+    bg = frame[:, :, :2].mean(axis=2).astype(np.float32)
+
+    # Downsample 4× for speed
+    scale = 4
+    small = cv2.resize(bg, (w // scale, h // scale))
+    sh, sw = small.shape[:2]
+
+    vmin, vmax = float(small.min()), float(small.max())
+    if vmax - vmin < 8:          # image has no meaningful contrast
+        return None
+    norm = (small - vmin) / (vmax - vmin)
+
+    # Very bright / very dark masks
+    bright_mask = (norm > 0.80).astype(np.float32)
+    dark_mask   = (norm < 0.20).astype(np.float32)
+
+    # Spread each mask over a neighbourhood (~1/8 image width at downsampled scale)
+    nbr   = max(3, sw // 8)
+    ksize = nbr * 2 + 1
+    sigma = nbr / 2.5
+    bright_sp = cv2.GaussianBlur(bright_mask, (ksize, ksize), sigma)
+    dark_sp   = cv2.GaussianBlur(dark_mask,   (ksize, ksize), sigma)
+
+    # Co-presence map: high where both bright and dark exist nearby
+    co = bright_sp * dark_sp
+    if co.max() < 1e-6:
+        return None
+
+    # Bounding box of the high co-presence region (> 30 % of peak)
+    region = (co > co.max() * 0.30).astype(np.uint8)
+    pts = cv2.findNonZero(region)
+    if pts is None:
+        return None
+
+    rx, ry, rw, rh = cv2.boundingRect(pts)
+
+    # Reject implausibly tiny detections (< 60 px at full resolution)
+    if max(rw, rh) * scale < 60:
+        return None
+
+    # Scale back to full resolution
+    rx, ry, rw, rh = rx * scale, ry * scale, rw * scale, rh * scale
+
+    # Expand by CROP_MARGIN and make square
+    side = int(max(rw, rh) * CROP_MARGIN)
+    cx   = rx + rw // 2
+    cy   = ry + rh // 2
+    half = side // 2
+
+    x1 = max(0, cx - half)
+    y1 = max(0, cy - half)
+    x2 = min(w, x1 + side)
+    y2 = min(h, y1 + side)
+    x1 = max(0, x2 - side)
+    y1 = max(0, y2 - side)
+
+    return x1, y1, x2 - x1, y2 - y1
+
+
+def _find_change_roi(frame_before, frame_after):
+    """Find the region that was red in frame_before and turned dark in frame_after.
+    This corresponds to the zone where the dilated pupil's fundus glow was covered
+    by the constricting iris after the first flash.
+
+    Signal = (red_channel_before − luminance_after).clip(0): peaks where something
+    was reddish (fundus visible through open pupil) and is now dark (iris closed over it).
+
+    Returns (x, y, w, h) as a square in frame coordinates (expanded by
+    CROP_MARGIN), or None if the signal is too weak.
+    """
+    h, w = frame_before.shape[:2]
+
+    # Red channel before; overall luminance after
+    red_b = frame_before[:, :, 2].astype(np.float32)
+    lum_a = cv2.cvtColor(frame_after, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # Downsample 4× for speed and noise averaging
+    scale       = 4
+    small_red_b = cv2.resize(red_b,  (w // scale, h // scale))
+    small_lum_a = cv2.resize(lum_a,  (w // scale, h // scale))
+    sh, sw      = small_red_b.shape[:2]
+
+    # Signal: was red before AND is now dark — clips negative (got brighter) to zero
+    signal = (small_red_b - small_lum_a).clip(min=0)
+
+    if signal.max() < 8.0:          # no meaningful red-to-dark transition
+        return None
+
+    # Threshold at 30 % of peak
+    region = (signal > signal.max() * 0.30).astype(np.uint8)
+
+    # Morphological close to fill the hollow centre of the change ring so the
+    # bounding box spans the full pupil disc, not just the annulus edge.
+    k      = max(3, sw // 12)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, kernel)
+
+    pts = cv2.findNonZero(region)
+    if pts is None:
+        return None
+
+    rx, ry, rw, rh = cv2.boundingRect(pts)
+
+    # Reject implausibly tiny detections (< 60 px at full resolution)
+    if max(rw, rh) * scale < 60:
+        return None
+
+    # Scale back to full resolution
+    rx, ry, rw, rh = rx * scale, ry * scale, rw * scale, rh * scale
+
+    # Expand by CROP_MARGIN and make square
+    side = int(max(rw, rh) * CROP_MARGIN)
+    cx   = rx + rw // 2
+    cy   = ry + rh // 2
+    half = side // 2
+
+    x1 = max(0, cx - half)
+    y1 = max(0, cy - half)
+    x2 = min(w, x1 + side)
+    y2 = min(h, y1 + side)
+    x1 = max(0, x2 - side)
+    y1 = max(0, y2 - side)
+
+    return x1, y1, x2 - x1, y2 - y1
 
 
 def _detect_reflex(frame):
@@ -596,26 +838,33 @@ def _detect_reflex(frame):
 
 
 def _pupil_overlay(frame):
-    return _volcano_overlay(frame, live=True)
+    """Fast live-feed overlay: orange circle around the detected corneal reflex."""
+    out = frame.copy()
+    result = _detect_reflex(frame)
+    if result is not None:
+        cx, cy, radius = result
+        cv2.circle(out, (cx, cy), radius, (0, 165, 255), 2)
+        cv2.circle(out, (cx, cy), 4, (0, 165, 255), -1)
+    return out
 
 
 def _focus_overlay(frame):
-    return _volcano_overlay(frame)
+    return _pupil_overlay(frame)
 
 
 def streaming_mode(picam2):
     """Live video feed. Hold SPACE to turn LED on, r to lock/unlock.
-    f toggles focus overlay on live feed. t toggles focus overlay on captures.
+    f toggles reflex circle on live feed, v toggles volcano detection on captures.
     Arrow keys rotate. Press ENTER or e to capture a still. Press s to exit."""
 
-    global LIVE_ROTATION
+    global LIVE_ROTATION, _last_roi, CROP_MARGIN
 
     if not CV2_AVAILABLE:
         print("cv2 not available - cannot show live feed.")
         return
 
     print("\nStreaming mode ON")
-    print("SPACE=LED | r=lock | f=pupil-overlay | ←/→=rotate | ENTER/e=capture | s=exit\n")
+    print("SPACE=LED | r=lock | f=reflex-overlay | ←/→=rotate | [/]=crop | ENTER/e=capture | s=exit\n")
 
     apply_camera_settings(picam2, FLASH_GAIN)
 
@@ -644,10 +893,11 @@ def streaming_mode(picam2):
 
     last_space_time = 0.0
     led_on = False
-    lock_on = False  # Space+Shift toggle
-    focus_overlay_on  = False
-    _overlay_counter  = 0
-    _overlay_cache    = None
+    lock_on = False
+    focus_overlay_on = False
+    _overlay_counter = 0
+    _overlay_cache   = None
+    _roi_counter     = 0
 
     try:
 
@@ -655,6 +905,14 @@ def streaming_mode(picam2):
 
             array = picam2.capture_array()
             frame = cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+            # Periodically update the contrast ROI on the raw frame
+            # (unrotated sensor-space coords, used by capture_image for ScalerCrop)
+            # (CROPPING DISABLED)
+            # _roi_counter += 1
+            # if _roi_counter % _LIVE_OVERLAY_SKIP == 0:
+            #     _r = _find_contrast_roi(frame)
+            #     if _r is not None:
+            #         _last_roi = _r
             rot = _CV2_ROTATIONS[LIVE_ROTATION]
             if rot is not None:
                 frame = cv2.rotate(frame, rot)
@@ -689,7 +947,7 @@ def streaming_mode(picam2):
                 led_on = False
                 last_space_time = 0.0
                 capture_image(picam2)
-                # Always annotate the preview with pupil location + focus score
+                # Annotate saved preview with reflex overlay
                 _saved = cv2.imread(PHOTO_PATH)
                 if _saved is not None:
                     cv2.imwrite(PHOTO_PATH, _focus_overlay(_saved))
@@ -704,10 +962,10 @@ def streaming_mode(picam2):
             elif key == ord('r'):
                 lock_on = not lock_on
 
-            # f toggles pupil overlay on live feed
+            # f toggles reflex circle on live feed
             elif key == ord('f'):
                 focus_overlay_on = not focus_overlay_on
-                print(f"Pupil overlay (live): {'ON' if focus_overlay_on else 'OFF'}")
+                print(f"Reflex overlay (live): {'ON' if focus_overlay_on else 'OFF'}")
 
             # Arrow keys: left=CCW step, right=CW step
             elif key == 65361:  # left arrow
@@ -716,6 +974,14 @@ def streaming_mode(picam2):
             elif key == 65363:  # right arrow
                 LIVE_ROTATION = (LIVE_ROTATION + 1) % 4
                 print(f"Rotation: {LIVE_ROTATION * 90}°")
+
+            # [ / ] adjust crop margin
+            elif key == ord('['):
+                CROP_MARGIN = max(0.5, round(CROP_MARGIN - 0.5, 1))
+                print(f"Crop margin: {CROP_MARGIN}×")
+            elif key == ord(']'):
+                CROP_MARGIN = round(CROP_MARGIN + 0.5, 1)
+                print(f"Crop margin: {CROP_MARGIN}×")
 
             should_be_on = lock_on or space_held
             if should_be_on and not led_on:
@@ -751,6 +1017,7 @@ def handle_parameter_command(cmd, picam2):
 
     global BRIGHTNESS
     global CONTRAST
+    global CROP_MARGIN
 
     parts = cmd.split()
 
@@ -824,6 +1091,9 @@ def handle_parameter_command(cmd, picam2):
 
         elif param == "contrast":
             CONTRAST = float(value)
+
+        elif param == "crop_margin":
+            CROP_MARGIN = float(value)
 
         else:
             print("Unknown parameter.")
