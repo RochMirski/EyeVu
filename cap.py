@@ -5,18 +5,26 @@ Raspberry Pi Zero + Camera Module V2
 
 CONTROLS
 ────────
-ENTER               Capture photo
+ENTER               Capture photo (ambient + flash pair)
 s + ENTER           Streaming mode
 q + ENTER           Quit
 
 Streaming mode
 ──────────────
-SPACE (hold)        LED on
-r                   Toggle LED lock on/off
-f                   Toggle focus metric overlay
+SPACE (hold)        Flash LED (GPIO 17) on
+r                   Toggle flash LED lock on/off
+a                   Toggle ambient LED (GPIO 27) on/off
+p                   Toggle live Orlosky pupil detection
 ←/→                 Rotate live feed
 ENTER or e          Capture still
 s                   Exit streaming
+
+PUPIL DETECTION
+───────────────
+Each capture takes two successive images: an ambient image lit by the
+GPIO 27 LED (pupil is a dark disc) and a retina-flash image lit by the
+GPIO 17 LED.  The Orlosky method detects the pupil in the ambient image
+and the resulting ellipse is drawn onto the flash photo.
 
 PARAMETERS
 ──────────
@@ -26,16 +34,16 @@ live_gain 1.0
 
 pre_delay 0.05
 post_delay 0.05
-
-flash1_duration 0.075
-flash_gap 3
-flash2_duration 0.075
+flash_duration 0.075
 
 brightness 2
 contrast 1
 
 red_gain 2.2
 blue_gain 1.4
+
+exclude_bottom 0.0
+debug 1
 """
 
 from picamera2 import Picamera2
@@ -61,10 +69,11 @@ except ImportError:
 
 # ───────── CONFIG ─────────
 
-LED_PIN  = 17
-LED_PIN_2 = 27
+LED_PIN   = 17     # flash LED   — retina retroreflection capture
+LED_PIN_2 = 27     # ambient LED — diffuse light for pupil detection
 
-PHOTO_PATH = "/tmp/retina_preview.jpg"
+PHOTO_PATH   = "/tmp/retina_preview.jpg"   # annotated flash photo
+AMBIENT_PATH = "/tmp/retina_ambient.jpg"   # raw ambient image (Swirski input)
 
 # Reduced slightly from 1640x1232
 # Faster on Pi Zero while still sharp
@@ -83,18 +92,11 @@ BLUE_GAIN = 1.4
 # Flash timing
 FLASH_PRE_DELAY = 0.05
 FLASH_POST_DELAY = 0.05
-
-FLASH1_DURATION = 0.075
-FLASH_GAP = 3.0
-FLASH2_DURATION = 0.075
+FLASH_DURATION = 0.075
 
 # Image processing
 BRIGHTNESS = 2.0
 CONTRAST = 1.0
-
-# ROI zoom: CROP_MARGIN multiplies the detected high-contrast region size
-# (1.0 = exact fit to region, 1.5 = 50% padding around it)
-CROP_MARGIN = 1.5
 
 # Rotation (index into ROTATION_* tables below)
 # 0=none, 1=90°CCW, 2=180°, 3=90°CW
@@ -142,16 +144,26 @@ def cleanup_gpio():
 
 
 def flash_on():
-
+    """Turn on the GPIO 17 flash LED (retina retroreflection)."""
     if GPIO_AVAILABLE:
-        GPIO.output(LED_PIN,  GPIO.HIGH)
-        GPIO.output(LED_PIN_2, GPIO.HIGH)
+        GPIO.output(LED_PIN, GPIO.HIGH)
 
 
 def flash_off():
-
+    """Turn off the GPIO 17 flash LED."""
     if GPIO_AVAILABLE:
-        GPIO.output(LED_PIN,  GPIO.LOW)
+        GPIO.output(LED_PIN, GPIO.LOW)
+
+
+def ambient_on():
+    """Turn on the GPIO 27 ambient LED (diffuse light for pupil detection)."""
+    if GPIO_AVAILABLE:
+        GPIO.output(LED_PIN_2, GPIO.HIGH)
+
+
+def ambient_off():
+    """Turn off the GPIO 27 ambient LED."""
+    if GPIO_AVAILABLE:
         GPIO.output(LED_PIN_2, GPIO.LOW)
 
 
@@ -190,10 +202,7 @@ def print_settings():
 
     print(f"pre_delay          = {FLASH_PRE_DELAY}")
     print(f"post_delay         = {FLASH_POST_DELAY}")
-
-    print(f"flash1_duration    = {FLASH1_DURATION}")
-    print(f"flash_gap          = {FLASH_GAP}")
-    print(f"flash2_duration    = {FLASH2_DURATION}")
+    print(f"flash_duration     = {FLASH_DURATION}")
 
     print()
 
@@ -202,12 +211,615 @@ def print_settings():
 
     print()
 
-    print(f"crop_margin        = {CROP_MARGIN}")
+    print(f"exclude_bottom     = {DETECT_EXCLUDE_BOTTOM}")
+    print(f"debug              = {SWIRSKI_DEBUG}")
 
     print("────────────────────────\n")
 
 
-def process_image(array):
+# ───────── PUPIL DETECTION (Orlosky) ─────────
+# Orlosky pupil detector — port of OrloskyPupilDetectorRaspberryPi.py.
+# Four stages:
+#   1. coarse: find the darkest small region
+#   2. threshold the image at (darkest pixel value + offset), inverted
+#   3. mask to a square ROI around the darkest point
+#   4. dilate, find contours, fit an ellipse to the largest plausible one
+# Run on the ambient image, where the pupil reads as a dark disc.
+# (The Swirski detector further below is commented out — kept for reference.)
+
+SWIRSKI_LIVE_DEFAULT  = False    # live-mode detection off by default
+
+# ── Swirski detector parameters (commented out — using Orlosky instead) ──
+# _SW_MIN_R_FRAC = 0.03 ; _SW_MAX_R_FRAC = 0.13 ; _SW_N_RADII = 6
+# _SW_COARSE_DOWNSCALE = 4 ; _SW_RANSAC_ITERS = 40 ; _SW_RANSAC_ITERS_LIVE = 12
+# _SW_INLIER_DIST = 2.0 ; _SW_MIN_SOLIDITY = 0.80 ; _SW_MAX_AXIS_RATIO = 2.2
+
+# ── Orlosky detector parameters ──
+_ORL_THRESHOLD_OFFSET = 15       # binary threshold = darkest pixel value + this
+_ORL_MASK_FRAC = 0.5             # ROI square side, as a fraction of min(h, w)
+_ORL_MIN_AREA_FRAC = 0.003       # min contour area, as a fraction of frame area
+_ORL_MAX_RATIO = 3.0             # max contour bounding-box aspect ratio
+_ORL_DARKEST_WIN = 20            # window size for the darkest-region search
+_ORL_DILATE_KERNEL = 5           # dilation kernel side
+_ORL_DILATE_ITERS = 2            # dilation iterations
+
+# Flash-LED-cover exclusion — the LED's physical cover intrudes into the frame
+# as a large near-black blob.  It is detected dynamically (a large,
+# border-touching, very dark region); DETECT_EXCLUDE_BOTTOM is an optional
+# manual fallback band (see handle_parameter_command's `exclude_bottom`).
+_LED_DARK_THRESH = 30            # intensity below which a pixel is "near-black"
+_LED_MIN_AREA_FRAC = 0.05        # min blob area (fraction of frame) to qualify
+DETECT_EXCLUDE_BOTTOM = 0.0      # manual fallback: blank this bottom fraction
+
+# Live mode: only recompute the detection every N frames
+_LIVE_DETECT_SKIP = 5
+
+# Debug — annotate EVERY detected pupil candidate (no plausibility filtering)
+# instead of a single filtered result.  Toggle at runtime with `debug 0` / `debug 1`.
+SWIRSKI_DEBUG = True
+
+
+def _find_led_cover_mask(gray):
+    """Locate the dark flash-LED cover so detection can ignore it.
+
+    The cover is the only large, near-black region that touches the frame
+    border.  A pupil is neither large nor border-touching, so it can never be
+    matched here.  Returns a uint8 mask of the cover, or None if none qualifies.
+    """
+    h, w = gray.shape[:2]
+    dark = (gray < _LED_DARK_THRESH).astype(np.uint8)
+    if int(dark.sum()) == 0:
+        return None
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark)
+    min_area = _LED_MIN_AREA_FRAC * h * w
+    mask = np.zeros((h, w), dtype=np.uint8)
+    found = False
+    for lbl in range(1, n):
+        x  = stats[lbl, cv2.CC_STAT_LEFT]
+        y  = stats[lbl, cv2.CC_STAT_TOP]
+        bw = stats[lbl, cv2.CC_STAT_WIDTH]
+        bh = stats[lbl, cv2.CC_STAT_HEIGHT]
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        touches_border = (x == 0 or y == 0 or x + bw == w or y + bh == h)
+        if touches_border and area > min_area:
+            mask[labels == lbl] = 255
+            found = True
+
+    if not found:
+        return None
+    # grow slightly — the out-of-focus cover has a soft, fuzzy edge
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    return cv2.dilate(mask, k)
+
+
+def _apply_exclusions(gray):
+    """Return a copy of `gray` with the flash-LED cover (detected dynamically)
+    and the optional manual bottom band blanked to white (255), so they cannot
+    be mistaken for a dark pupil."""
+    h = gray.shape[0]
+    g = gray.copy()
+    cover = _find_led_cover_mask(g)
+    if cover is not None:
+        g[cover > 0] = 255
+    if DETECT_EXCLUDE_BOTTOM > 0:
+        y_ex = int(h * (1.0 - min(0.9, DETECT_EXCLUDE_BOTTOM)))
+        g[y_ex:, :] = 255
+    return g
+
+
+# ── Swirski detector (commented out — Orlosky is used instead; see below) ──
+'''
+def _swirski_coarse(gray, rmin, rmax):
+    """Stage 1 — Haar-like coarse pupil detection.
+
+    The pupil is a dark disc surrounded by a lighter iris.  For each candidate
+    radius (rmin..rmax) we evaluate, at every pixel, (mean of a surrounding box)
+    − (mean of a central box); the pupil centre maximises this response.  Box
+    means are O(1) via cv2.boxFilter, so testing a handful of radii is cheap.
+
+    Returns (cx, cy, r) in `gray` coordinates, or None.
+    """
+    h, w = gray.shape[:2]
+    ds = _SW_COARSE_DOWNSCALE
+    small = cv2.resize(gray, (max(1, w // ds), max(1, h // ds)))
+    small = small.astype(np.float32)
+    sh, sw = small.shape[:2]
+
+    best_resp = -1e9
+    best = None
+    for r in np.linspace(rmin, rmax, _SW_N_RADII):
+        rs = max(1, int(r / ds))          # pupil-scale box half-size
+        inner_k = rs * 2 + 1
+        outer_k = rs * 6 + 1              # 3× scale surround
+        m = rs * 3                        # border to keep both boxes in-frame
+        if outer_k >= min(sh, sw) or m * 2 >= min(sh, sw):
+            continue
+
+        inner = cv2.boxFilter(small, -1, (inner_k, inner_k),
+                              normalize=True, borderType=cv2.BORDER_REPLICATE)
+        outer = cv2.boxFilter(small, -1, (outer_k, outer_k),
+                              normalize=True, borderType=cv2.BORDER_REPLICATE)
+
+        # surround mean = (outer*outer_area − inner*inner_area) / surround_area
+        ia = float(inner_k * inner_k)
+        oa = float(outer_k * outer_k)
+        surround = (outer * oa - inner * ia) / (oa - ia)
+        resp = surround - inner           # large where centre dark, ring light
+
+        roi = resp[m:sh - m, m:sw - m]
+        _, mx, _, mx_loc = cv2.minMaxLoc(roi)
+        if mx > best_resp:
+            best_resp = mx
+            cx = (mx_loc[0] + m) * ds
+            cy = (mx_loc[1] + m) * ds
+            best = (int(cx), int(cy), int(r))
+
+    return best
+
+
+def _swirski_segment(gray, cx, cy, r, rmin, rmax):
+    """Stage 2 — intensity-histogram segmentation around the coarse centre.
+
+    Crops a tight ROI (~2.2× the coarse radius), applies an Otsu threshold (the
+    two-cluster intensity split that separates the dark pupil from the lighter
+    iris), cleans it morphologically and keeps the blob containing the coarse
+    centre.  The blob is then checked for pupil plausibility — it must not run
+    off the ROI edge, must be near-convex, and must be of pupil scale.
+
+    Returns (mask, x0, y0) — binary pupil mask and ROI top-left offset — or None.
+    """
+    h, w = gray.shape[:2]
+    half = max(20, int(r * 2.2))
+    x0 = max(0, cx - half)
+    y0 = max(0, cy - half)
+    x1 = min(w, cx + half)
+    y1 = min(h, cy + half)
+    roi = gray[y0:y1, x0:x1]
+    if roi.size == 0 or min(roi.shape[:2]) < 10:
+        return None
+
+    roi = cv2.GaussianBlur(roi, (5, 5), 0)
+    # THRESH_BINARY_INV → dark pupil becomes 255
+    _, mask = cv2.threshold(roi, 0, 255,
+                            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+
+    # Keep only the connected component containing the coarse centre
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    if n <= 1:
+        return None
+    lx, ly = cx - x0, cy - y0
+    lbl = 0
+    if 0 <= ly < mask.shape[0] and 0 <= lx < mask.shape[1]:
+        lbl = int(labels[ly, lx])
+    if lbl == 0:
+        # coarse centre not on a blob — fall back to the largest blob
+        lbl = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+
+    # ── pupil-plausibility checks ──────────────────────────────────────────
+    mh, mw = mask.shape[:2]
+    bx = stats[lbl, cv2.CC_STAT_LEFT]
+    by = stats[lbl, cv2.CC_STAT_TOP]
+    bw = stats[lbl, cv2.CC_STAT_WIDTH]
+    bh = stats[lbl, cv2.CC_STAT_HEIGHT]
+    area = stats[lbl, cv2.CC_STAT_AREA]
+    # touches the ROI border → blob runs off the crop, not a clean pupil
+    if bx == 0 or by == 0 or bx + bw == mw or by + bh == mh:
+        return None
+    # equivalent radius must be of pupil scale
+    equiv_r = np.sqrt(area / np.pi)
+    if equiv_r < rmin or equiv_r > rmax:
+        return None
+
+    mask = np.where(labels == lbl, 255, 0).astype(np.uint8)
+
+    # solidity — a pupil blob is near-convex
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    hull_area = cv2.contourArea(cv2.convexHull(c))
+    if hull_area <= 0 or cv2.contourArea(c) / hull_area < _SW_MIN_SOLIDITY:
+        return None
+
+    return mask, x0, y0
+
+
+def _swirski_support(ellipse, pts, gx, gy):
+    """Score a candidate ellipse by image-aware support.
+
+    A contour point supports the ellipse if it lies within _SW_INLIER_DIST of
+    the ellipse boundary AND its local image gradient points outward (dark
+    pupil → light iris) — Swirski's image-aware support term.
+
+    Returns (inlier_count, inlier_mask).
+    """
+    (ex, ey), (MA, ma), ang = ellipse
+    a, b = MA / 2.0, ma / 2.0
+    if a < 1.0 or b < 1.0:
+        return 0, None
+
+    th = np.deg2rad(ang)
+    cos_t, sin_t = np.cos(th), np.sin(th)
+
+    dx = pts[:, 0] - ex
+    dy = pts[:, 1] - ey
+    # rotate into the ellipse's canonical frame
+    xr =  cos_t * dx + sin_t * dy
+    yr = -sin_t * dx + cos_t * dy
+    t = np.sqrt((xr / a) ** 2 + (yr / b) ** 2)   # 1.0 on the boundary
+
+    mean_r = (a + b) / 2.0
+    near = np.abs(t - 1.0) < (_SW_INLIER_DIST / mean_r)
+
+    # gradient must point outward from the ellipse centre (dark → light)
+    ix = np.clip(pts[:, 0].astype(int), 0, gx.shape[1] - 1)
+    iy = np.clip(pts[:, 1].astype(int), 0, gx.shape[0] - 1)
+    g_dot = gx[iy, ix] * dx + gy[iy, ix] * dy
+
+    inliers = near & (g_dot > 0)
+    return int(inliers.sum()), inliers
+
+
+def _swirski_fit_ellipse(mask, gray_roi, iters):
+    """Stage 3 — RANSAC ellipse fit with image-aware support.
+
+    Fits an ellipse to the pupil-mask boundary.  Each RANSAC hypothesis is
+    built from 5 random boundary points and scored by _swirski_support; the
+    best hypothesis is refined with a final fit to its inliers.
+
+    Returns an ellipse ((cx,cy),(MA,ma),angle) in ROI coordinates, or None.
+    """
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return None
+    pts = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+    if len(pts) < 5:
+        return None
+
+    # image gradient — used by the image-aware support test
+    gx = cv2.Sobel(gray_roi, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray_roi, cv2.CV_32F, 0, 1, ksize=3)
+
+    n = len(pts)
+    rng = np.random.default_rng(0)
+    best_score = 0
+    best_inliers = None
+    for _ in range(iters):
+        idx = rng.choice(n, 5, replace=False)
+        try:
+            ell = cv2.fitEllipse(pts[idx])
+        except cv2.error:
+            continue
+        score, inliers = _swirski_support(ell, pts, gx, gy)
+        if score > best_score:
+            best_score = score
+            best_inliers = inliers
+
+    if best_inliers is None or int(best_inliers.sum()) < 5:
+        # fall back to a plain fit on all boundary points
+        try:
+            return cv2.fitEllipse(pts)
+        except cv2.error:
+            return None
+    try:
+        return cv2.fitEllipse(pts[best_inliers])
+    except cv2.error:
+        return None
+
+
+def swirski_detect_pupil(gray, live=False):
+    """Detect the pupil with the Swirski method.
+
+    `gray` is a single-channel uint8 image (the ambient image).  Returns an
+    ellipse ((cx,cy),(MA,ma),angle) in `gray` coordinates, or None.
+    `live=True` uses fewer RANSAC iterations for streaming-mode speed.
+
+    The dark flash-LED cover, and an optional manual bottom band, are blanked
+    out so they cannot be mistaken for the pupil.
+    """
+    if not CV2_AVAILABLE:
+        return None
+    if gray.ndim != 2:
+        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+
+    h, w = gray.shape[:2]
+    # Blank the flash-LED cover and the optional manual fallback band
+    gray = _apply_exclusions(gray)
+
+    rmin = _SW_MIN_R_FRAC * min(h, w)
+    rmax = _SW_MAX_R_FRAC * min(h, w)
+
+    coarse = _swirski_coarse(gray, rmin, rmax)
+    if coarse is None:
+        return None
+    cx, cy, r = coarse
+
+    seg = _swirski_segment(gray, cx, cy, r, rmin, rmax)
+    if seg is None:
+        return None
+    mask, x0, y0 = seg
+
+    gray_roi = gray[y0:y0 + mask.shape[0], x0:x0 + mask.shape[1]]
+    iters = _SW_RANSAC_ITERS_LIVE if live else _SW_RANSAC_ITERS
+    ell = _swirski_fit_ellipse(mask, gray_roi, iters)
+    if ell is None:
+        return None
+
+    (ex, ey), (MA, ma), ang = ell
+    # reject implausible ellipses (too elongated or larger than a pupil)
+    if min(MA, ma) <= 0:
+        return None
+    if max(MA, ma) / min(MA, ma) > _SW_MAX_AXIS_RATIO:
+        return None
+    if max(MA, ma) / 2.0 > rmax * 1.3:
+        return None
+
+    return ((ex + x0, ey + y0), (MA, ma), ang)
+
+
+def _swirski_all_candidates(gray):
+    """Debug — segment the whole (exclusion-masked) image and fit an ellipse to
+    every dark blob.  Returns a list of candidate dicts with shape metrics; no
+    plausibility filtering is applied (nothing is discarded by thresholds)."""
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask = cv2.threshold(blur, 0, 255,
+                            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    out = []
+    for lbl in range(1, n):
+        comp = np.where(labels == lbl, 255, 0).astype(np.uint8)
+        cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        c = max(cnts, key=cv2.contourArea)
+        if len(c) < 5:                       # cv2.fitEllipse needs >= 5 points
+            continue
+        try:
+            ell = cv2.fitEllipse(c)
+        except cv2.error:
+            continue
+        MA, ma = ell[1]
+        area = float(stats[lbl, cv2.CC_STAT_AREA])
+        equiv_r = float(np.sqrt(area / np.pi))
+        hull_area = cv2.contourArea(cv2.convexHull(c))
+        solidity = (cv2.contourArea(c) / hull_area) if hull_area > 0 else 0.0
+        axis_ratio = (max(MA, ma) / min(MA, ma)) if min(MA, ma) > 0 else 0.0
+        out.append({
+            "ellipse": ell,
+            "equiv_r": equiv_r,
+            "solidity": solidity,
+            "axis_ratio": axis_ratio,
+        })
+    return out
+
+
+def swirski_detect(gray, live=False):
+    """Return a list of candidate overlays to draw on the image.
+
+    Normal mode: the single best, plausibility-checked pupil (or an empty list).
+    Debug mode (`SWIRSKI_DEBUG`): every detected candidate, unfiltered, each
+    labelled with its shape metrics, plus the stage-1 Haar coarse pick.
+
+    Each overlay is a dict: {"ellipse": ((cx,cy),(MA,ma),ang),
+                             "label": str, "color": (b,g,r)}.
+    """
+    if not CV2_AVAILABLE:
+        return []
+    if gray.ndim != 2:
+        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+
+    if not SWIRSKI_DEBUG:
+        ell = swirski_detect_pupil(gray, live=live)
+        if ell is None:
+            return []
+        (ex, ey), _, _ = ell
+        if not live:
+            print(f"Pupil detected at ({int(ex)}, {int(ey)}).")
+        return [{"ellipse": ell, "label": "", "color": (0, 255, 0)}]
+
+    # ── debug: annotate every candidate, discard nothing ──────────────────
+    masked = _apply_exclusions(gray)
+    cands = _swirski_all_candidates(masked)
+    if not live:
+        print(f"[debug] {len(cands)} pupil candidate(s):")
+        for i, c in enumerate(cands, 1):
+            print(f"  {i}: r={c['equiv_r']:.0f}  solidity={c['solidity']:.2f}"
+                  f"  axis_ratio={c['axis_ratio']:.2f}")
+
+    overlays = []
+    for i, c in enumerate(cands, 1):
+        overlays.append({
+            "ellipse": c["ellipse"],
+            "label": (f"{i} r={c['equiv_r']:.0f} "
+                      f"sol={c['solidity']:.2f} ar={c['axis_ratio']:.1f}"),
+            "color": (0, 255, 255),          # yellow — candidate
+        })
+
+    # also show where the Haar coarse stage thinks the pupil is
+    h, w = masked.shape[:2]
+    coarse = _swirski_coarse(masked, _SW_MIN_R_FRAC * min(h, w),
+                             _SW_MAX_R_FRAC * min(h, w))
+    if coarse is not None:
+        cx, cy, r = coarse
+        overlays.append({
+            "ellipse": ((float(cx), float(cy)),
+                        (float(2 * r), float(2 * r)), 0.0),
+            "label": "coarse",
+            "color": (255, 0, 255),          # magenta — coarse pick
+        })
+    return overlays
+'''
+# ── end Swirski detector (commented out) ────────────────────────────────────
+
+
+# ───────── ORLOSKY DETECTOR — active ─────────
+
+def _orlosky_darkest_area(gray):
+    """Coarse stage — return (x, y) of the centre of the darkest small region.
+
+    Equivalent to Orlosky's sparse darkest-area search, done here with a
+    box-filter local mean + minMaxLoc for speed.
+    """
+    win = _ORL_DARKEST_WIN
+    blurred = cv2.boxFilter(gray, -1, (win, win),
+                            normalize=True, borderType=cv2.BORDER_REPLICATE)
+    h, w = gray.shape[:2]
+    b = win
+    if h > 2 * b and w > 2 * b:
+        roi = blurred[b:h - b, b:w - b]
+        ox, oy = b, b
+    else:
+        roi = blurred
+        ox, oy = 0, 0
+    _minv, _maxv, min_loc, _maxloc = cv2.minMaxLoc(roi)
+    return (min_loc[0] + ox, min_loc[1] + oy)
+
+
+def _mask_outside_square(image, center, size):
+    """Zero every pixel outside a `size`×`size` square centred on `center`."""
+    x, y = center
+    half = size // 2
+    mask = np.zeros_like(image)
+    x0 = max(0, x - half)
+    y0 = max(0, y - half)
+    x1 = min(image.shape[1], x + half)
+    y1 = min(image.shape[0], y + half)
+    mask[y0:y1, x0:x1] = 255
+    return cv2.bitwise_and(image, mask)
+
+
+def _orlosky_contours(gray):
+    """Run the Orlosky pipeline on an exclusion-masked grayscale image:
+    darkest-region search → relative threshold → ROI mask → dilate → contours.
+
+    Returns (contours, darkest_point)."""
+    darkest = _orlosky_darkest_area(gray)
+    if darkest is None:
+        return [], None
+
+    h, w = gray.shape[:2]
+    dval = int(gray[darkest[1], darkest[0]])
+    thresh = dval + _ORL_THRESHOLD_OFFSET
+
+    # dark pupil → white
+    _, binary = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY_INV)
+    # keep only a square ROI around the darkest point
+    binary = _mask_outside_square(binary, darkest,
+                                  int(_ORL_MASK_FRAC * min(h, w)))
+    # dilate to close the pupil blob
+    kernel = np.ones((_ORL_DILATE_KERNEL, _ORL_DILATE_KERNEL), np.uint8)
+    binary = cv2.dilate(binary, kernel, iterations=_ORL_DILATE_ITERS)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    return contours, darkest
+
+
+def detect_pupil(gray, live=False):
+    """Detect the pupil with the Orlosky method.
+
+    Returns a list of overlay dicts to draw — see _draw_overlays().
+    Normal mode: the single largest plausible pupil contour (green).
+    Debug mode (`SWIRSKI_DEBUG`): every contour found, unfiltered, each
+    labelled with its area and aspect ratio (yellow), plus the darkest point.
+    """
+    if not CV2_AVAILABLE:
+        return []
+    if gray.ndim != 2:
+        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+
+    # Blank the flash-LED cover so the darkest-area search ignores it
+    gray = _apply_exclusions(gray)
+    h, w = gray.shape[:2]
+    min_area = _ORL_MIN_AREA_FRAC * h * w
+
+    contours, darkest = _orlosky_contours(gray)
+
+    if not SWIRSKI_DEBUG:
+        best = None
+        best_area = 0.0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < min_area or len(c) < 5:
+                continue
+            _x, _y, bw, bh = cv2.boundingRect(c)
+            if min(bw, bh) == 0:
+                continue
+            if max(bw / bh, bh / bw) > _ORL_MAX_RATIO:
+                continue
+            if area > best_area:
+                best_area = area
+                best = c
+        if best is None:
+            return []
+        try:
+            ell = cv2.fitEllipse(best)
+        except cv2.error:
+            return []
+        (ex, ey), _, _ = ell
+        if not live:
+            print(f"Pupil detected at ({int(ex)}, {int(ey)}).")
+        return [{"ellipse": ell, "label": "", "color": (0, 255, 0)}]
+
+    # ── debug: annotate every contour, discard nothing ────────────────────
+    overlays = []
+    n = 0
+    for c in contours:
+        if len(c) < 5:                       # cv2.fitEllipse needs >= 5 points
+            continue
+        try:
+            ell = cv2.fitEllipse(c)
+        except cv2.error:
+            continue
+        n += 1
+        area = cv2.contourArea(c)
+        _x, _y, bw, bh = cv2.boundingRect(c)
+        ratio = max(bw / bh, bh / bw) if min(bw, bh) > 0 else 0.0
+        overlays.append({
+            "ellipse": ell,
+            "label": f"{n} a={int(area)} ar={ratio:.1f}",
+            "color": (0, 255, 255),          # yellow — candidate contour
+        })
+    if not live:
+        print(f"[debug] {n} pupil candidate(s) (Orlosky).")
+    if darkest is not None:
+        overlays.append({
+            "ellipse": ((float(darkest[0]), float(darkest[1])),
+                        (16.0, 16.0), 0.0),
+            "label": "darkest",
+            "color": (255, 0, 255),          # magenta — darkest point
+        })
+    return overlays
+
+
+def _draw_overlays(bgr, overlays):
+    """Draw a list of candidate overlays (ellipse + centre dot + optional
+    label) on a BGR image."""
+    for ov in overlays:
+        (ex, ey), (MA, ma), ang = ov["ellipse"]
+        col = ov.get("color", (0, 255, 0))
+        box = ((float(ex), float(ey)), (float(MA), float(ma)), float(ang))
+        cv2.ellipse(bgr, box, col, 2)
+        cv2.circle(bgr, (int(round(ex)), int(round(ey))), 3, col, -1)
+        label = ov.get("label", "")
+        if label:
+            ty = int(ey) - int(max(MA, ma) / 2) - 6
+            cv2.putText(bgr, label, (int(ex) - 45, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
+    return bgr
+
+
+def process_image(array, overlays=None):
 
     img = Image.fromarray(array)
 
@@ -226,645 +838,98 @@ def process_image(array):
     if angle:
         img = img.rotate(angle, expand=True)
 
+    # Draw the pupil candidate overlay(s) after rotation — they are already in
+    # the rotated (display) orientation, the same as the rotated image, so no
+    # coordinate transform is needed.
+    if overlays and CV2_AVAILABLE:
+        arr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        _draw_overlays(arr, overlays)
+        img = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+
     return img
 
 
 def capture_image(picam2):
-    # ─────────────────────────────────────────────────────────────────────────
-    # ROI ZOOM / RESOLUTION ENHANCEMENT — DESIGN NOTES
-    # ─────────────────────────────────────────────────────────────────────────
-    # Goal: increase pixel density over the pupil/fundus disc, discard the
-    # surrounding iris/eyelid area that carries no diagnostic information.
-    #
-    # WHY THIS IS FULLY ACHIEVABLE on the Pi Camera Module V2 (IMX219):
-    #
-    #   The sensor's native resolution is 3280 × 2464 px.  We currently
-    #   capture at 1280 × 960, which means we are already throwing away
-    #   (3280*2464) / (1280*960) ≈ 6.6× of the available sensor pixels by
-    #   down-sampling the whole field of view uniformly.
-    #
-    #   picamera2 exposes the `ScalerCrop` control, which tells the ISP to
-    #   read out only a rectangular sub-region of the full sensor area and
-    #   then scale *that* region up to the requested output size.  This is a
-    #   true optical crop — equivalent to moving the camera closer — and
-    #   gives genuine sub-pixel resolution improvement over the pupil, not
-    #   just a post-capture digital zoom.
-    #
-    # HOW IT WOULD WORK:
-    #
-    #   1.  From the live feed the pupil centre (cx, cy) and radius (r) are
-    #       already known from _detect_reflex().  These are in display-frame
-    #       coordinates (e.g. 480 × 640 after resize + rotation).
-    #
-    #   2.  Map those coordinates back through the rotation and the
-    #       resize to get sensor-frame coordinates:
-    #
-    #         sensor_x = cx_live * (CAMERA_WIDTH  / DISPLAY_W)
-    #         sensor_y = cy_live * (CAMERA_HEIGHT / DISPLAY_H)
-    #         margin   = r_live  * (CAMERA_WIDTH  / DISPLAY_W) * 1.5
-    #         crop_x   = max(0, int(sensor_x - margin))
-    #         crop_y   = max(0, int(sensor_y - margin))
-    #         crop_w   = min(CAMERA_WIDTH  - crop_x, int(margin * 2))
-    #         crop_h   = min(CAMERA_HEIGHT - crop_y, int(margin * 2))
-    #
-    #   3.  picamera2 ScalerCrop takes the crop in *native full-sensor*
-    #       coordinates.  Because we configure the camera at 1280 × 960
-    #       (which itself corresponds to a centred crop of the 3280 × 2464
-    #       sensor), we also need to apply the sensor-to-output scale factor
-    #       and the ISP's centred-crop offset:
-    #
-    #         native_scale_x = 3280 / CAMERA_WIDTH   # ≈ 2.5625
-    #         native_scale_y = 2464 / CAMERA_HEIGHT  # ≈ 2.5667
-    #         native_offset_x = (3280 - CAMERA_WIDTH  * native_scale_x) / 2  # = 0
-    #         native_offset_y = (2464 - CAMERA_HEIGHT * native_scale_y) / 2  # ≈ 0
-    #         scaler_crop = (
-    #             int(crop_x * native_scale_x + native_offset_x),
-    #             int(crop_y * native_scale_y + native_offset_y),
-    #             int(crop_w * native_scale_x),
-    #             int(crop_h * native_scale_y),
-    #         )
-    #         picam2.set_controls({"ScalerCrop": scaler_crop})
-    #
-    #   4.  Capture as normal. The 1280 × 960 output now contains only the
-    #       pupil region, so every pixel is worth 6.6× more information
-    #       than in the full-frame capture. After capture, restore the
-    #       ScalerCrop to the full sensor area:
-    #         picam2.set_controls({"ScalerCrop": (0, 0, 3280, 2464)})
-    #
-    # PRACTICAL CAVEATS:
-    #
-    #   a)  ScalerCrop must be set *before* the flash so there is time for
-    #       the ISP to apply the new crop (a 1–2 frame settling delay, ~50 ms
-    #       at 20 fps, is sufficient — the existing FLASH_PRE_DELAY covers it).
-    #
-    #   b)  The pupil centre from the live feed is measured at a different
-    #       instant than the flash capture (patient may move slightly).
-    #       Using a generous margin (1.5–2× the pupil radius) compensates.
-    #
-    #   c)  The rotation applied to the live display (LIVE_ROTATION) must be
-    #       inverted when mapping back to raw sensor coordinates; the sensor
-    #       itself is never rotated — only the display pipeline is.
-    #
-    #   d)  If _detect_reflex() returns None (no bright spot found yet),
-    #       fall back to the full-frame capture as today.
-    #
-    # This approach is therefore entirely feasible and would be straightforward
-    # to implement once the coordinate-mapping logic above is wired up and the
-    # last detected pupil position is stored in a module-level variable that
-    # capture_image() can read.
-    # ─────────────────────────────────────────────────────────────────────────
+    """Capture a flash + ambient image pair and detect the pupil.
 
-    print("Flash + capture...")
+    1.  GPIO 17 (flash) lit → capture the retina-flash image first, while the
+        pupil is still maximally dilated.
+    2.  GPIO 27 (ambient) lit → capture the ambient image.  The pupil reads as
+        a dark disc here, suitable for Swirski detection.
+    3.  Detect the pupil in the ambient image with the Swirski method and draw
+        the resulting ellipse onto the flash photo.
 
-    # Apply flash settings
-    apply_camera_settings(
-        picam2,
-        FLASH_GAIN
-    )
+    The raw ambient image is saved to AMBIENT_PATH; the annotated flash photo
+    to PHOTO_PATH.
+    """
+    print("Capturing flash + ambient pair...")
 
+    apply_camera_settings(picam2, FLASH_GAIN)
     time.sleep(0.02)
 
-    # ───────── FIRST FLASH (pupil constriction) ─────────
-    # Capture a baseline frame (pupil dilated, ambient light only), fire the
-    # flash, then capture again after constriction peaks.  The region that
-    # changed most is where the pupil boundary moved — use it as the crop ROI.
-
-    array_before = picam2.capture_array()
-
+    # ───────── FLASH IMAGE (GPIO 17) — first, pupil still dilated ─────────
     flash_on()
-    time.sleep(FLASH1_DURATION)
-    flash_off()
-
-    # Wait for pupil constriction to peak (~0.5–0.8 s post-flash)
-    _CONSTRICT_DELAY = 0.7
-    time.sleep(_CONSTRICT_DELAY)
-
-    array_after = picam2.capture_array()
-
-    # Derive ROI from the change between frames; fall back to streaming estimate
-    # (CROPPING DISABLED)
-    # _roi_crop_applied = False
-    # if CV2_AVAILABLE:
-    #     frame_before = cv2.cvtColor(array_before, cv2.COLOR_RGB2BGR)
-    #     frame_after  = cv2.cvtColor(array_after,  cv2.COLOR_RGB2BGR)
-    #     roi = _find_change_roi(frame_before, frame_after)
-    #     if roi is None:
-    #         roi = _last_roi
-    # else:
-    #     roi = _last_roi
-    # if roi is not None:
-    #     rx, ry, rw, rh = roi
-    #     sx = 3280 / CAMERA_WIDTH                # ≈ 2.5625
-    #     sy = 2464 / CAMERA_HEIGHT               # ≈ 2.5667
-    #     scaler_crop = (
-    #         int(rx * sx),
-    #         int(ry * sy),
-    #         int(rw * sx),
-    #         int(rh * sy),
-    #     )
-    #     picam2.set_controls({"ScalerCrop": scaler_crop})
-    #     print(f"ROI zoom applied: sensor crop {scaler_crop}")
-    #     _roi_crop_applied = True
-
-    # Wait out the remainder of the inter-flash gap
-    elapsed = FLASH1_DURATION + _CONSTRICT_DELAY
-    time.sleep(max(0.0, FLASH_GAP - elapsed))
-
-    # ───────── SECOND FLASH (main capture) ─────────
-
-    flash_on()
-
     time.sleep(FLASH_PRE_DELAY)
-
-    # Capture while flash ON
-    array = picam2.capture_array()
-
-    time.sleep(FLASH2_DURATION)
-
+    flash_array = picam2.capture_array()
+    time.sleep(FLASH_DURATION)
     flash_off()
-
     time.sleep(FLASH_POST_DELAY)
 
+    # ───────── AMBIENT IMAGE (GPIO 27) — second ─────────
+    ambient_on()
+    time.sleep(FLASH_PRE_DELAY)
+    ambient_array = picam2.capture_array()
+    ambient_off()
+
     # Restore live settings
-    apply_camera_settings(
-        picam2,
-        LIVE_GAIN
-    )
+    apply_camera_settings(picam2, LIVE_GAIN)
 
-    # Restore full-frame sensor crop (CROPPING DISABLED)
-    # if _roi_crop_applied:
-    #     picam2.set_controls({"ScalerCrop": (0, 0, 3280, 2464)})
+    # Save the raw ambient image for inspection
+    Image.fromarray(ambient_array).save(AMBIENT_PATH)
 
-    # Process image
-    img = process_image(array)
+    # ───────── PUPIL DETECTION (Swirski) ─────────
+    # Detection runs in the display (rotated) orientation so its result lines
+    # up with the rotated flash photo that process_image() produces.
+    overlays = []
+    if CV2_AVAILABLE:
+        amb_bgr = cv2.cvtColor(ambient_array, cv2.COLOR_RGB2BGR)
+        rot = _CV2_ROTATIONS[LIVE_ROTATION]
+        if rot is not None:
+            amb_bgr = cv2.rotate(amb_bgr, rot)
+        gray = cv2.cvtColor(amb_bgr, cv2.COLOR_BGR2GRAY)
+        overlays = detect_pupil(gray)
+        if not overlays:
+            print("No pupil candidates detected.")
+    else:
+        print("cv2 not available - pupil detection skipped.")
 
-    # Update preview image
+    # Process the flash image, drawing the pupil candidate overlay(s)
+    img = process_image(flash_array, overlays)
     img.save(PHOTO_PATH)
 
     print("Captured.")
 
 
-# ── Overlay helpers ──────────────────────────────────────────────────────────
-# Only recompute live overlay every N frames
-_LIVE_OVERLAY_SKIP = 5
-# Last detected high-contrast ROI (x, y, w, h) in camera-frame coordinates.
-# Updated periodically in streaming_mode; used by capture_image for ScalerCrop.
-_last_roi = None
-
-# ── Volcano / concentric-ring detection (disabled) ───────────────────────────
-'''
-_V_LOCAL_KERNEL   = 50
-_V_MIN_CONTRAST   = 0.10
-_V_MAX_RIM_R      = 220
-_V_N_ANGLES       = 180
-_V_RING_SEP_RATIO = 1.3
-_V_CENTRE_TOL     = 55
-_V_RING_SIZE_TOL  = 0.50
-_V_SPECULAR_PCT   = 99.0
-_V_INPAINT_R      = 7
-_V_LIVE_MAX_RIM_R = 100
-_V_ROI_SIZE = 350
-
-_V_PIT_COL   = (0,   255, 255)   # yellow  — pit edge
-_V_RIM_COL   = (255,   0, 255)   # magenta — rim
-_V_PEAK_COL  = (0,   165, 255)   # orange  — peak-volcano
-
-
-def _find_roi(img, cx_hint=None, cy_hint=None):
-    """Return (x1, y1, x2, y2) of a _V_ROI_SIZE square.
-    If cx_hint/cy_hint are provided (e.g. from the Purkinje reflection) centre
-    there directly; otherwise fall back to the brightest region of img."""
-    h, w = img.shape[:2]
-    half  = _V_ROI_SIZE // 2
-    if cx_hint is not None and cy_hint is not None:
-        cx, cy = cx_hint, cy_hint
-    else:
-        gray = np.max(img, axis=2).astype(np.float32)
-        blur = cv2.GaussianBlur(gray, (101, 101), 0)
-        _, _, _, max_loc = cv2.minMaxLoc(blur)
-        cx, cy = max_loc
-    x1 = max(0, cx - half)
-    y1 = max(0, cy - half)
-    x2 = min(w, x1 + _V_ROI_SIZE)
-    y2 = min(h, y1 + _V_ROI_SIZE)
-    # Shift back if clipped at right/bottom edge
-    x1 = max(0, x2 - _V_ROI_SIZE)
-    y1 = max(0, y2 - _V_ROI_SIZE)
-    return x1, y1, x2, y2
-
-
-def _v_radial_profile(smooth, cx, cy, max_r):
-    angles = np.linspace(0, 2 * np.pi, _V_N_ANGLES, endpoint=False)
-    cos_a, sin_a = np.cos(angles), np.sin(angles)
-    prof = np.zeros(max_r, dtype=np.float32)
-    for r in range(max_r):
-        xs = np.clip((cx + r * cos_a).astype(int), 0, smooth.shape[1] - 1)
-        ys = np.clip((cy + r * sin_a).astype(int), 0, smooth.shape[0] - 1)
-        prof[r] = smooth[ys, xs].mean()
-    return prof
-
-
-def _v_find_volcanos(channel_u8, img_h, img_w, max_rim_r=None):
-    if max_rim_r is None:
-        max_rim_r = _V_MAX_RIM_R
-    smooth   = cv2.GaussianBlur(channel_u8.astype(np.float32), (31, 31), 0)
-    ch_range = float(smooth.max() - smooth.min())
-    if ch_range == 0:
-        return []
-    kernel       = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                              (_V_LOCAL_KERNEL, _V_LOCAL_KERNEL))
-    eroded       = cv2.erode(smooth,  kernel)
-    dilated      = cv2.dilate(smooth, kernel)
-    contrast_map = dilated - eroded
-    local_min    = ((smooth - eroded)  < 1.5) & (contrast_map > ch_range * _V_MIN_CONTRAST)
-    local_max    = ((dilated - smooth) < 1.5) & (contrast_map > ch_range * _V_MIN_CONTRAST)
-
-    results = []
-    for mask, kind in ((local_min.astype(np.uint8), 'pit'),
-                       (local_max.astype(np.uint8), 'peak')):
-        n_labels, _, _, centroids = cv2.connectedComponentsWithStats(mask)
-        for lbl in range(1, n_labels):
-            cx, cy  = int(centroids[lbl][0]), int(centroids[lbl][1])
-            safe_r  = min(cx, cy, img_w - cx - 1, img_h - cy - 1, max_rim_r)
-            if safe_r < 20:
-                continue
-            prof       = _v_radial_profile(smooth, cx, cy, safe_r)
-            center_val = prof[0]
-            search_end = min(safe_r - 1, max_rim_r)
-            if kind == 'pit':
-                rim_idx  = int(np.argmax(prof[5:search_end])) + 5
-                contrast = (prof[rim_idx] - center_val) / ch_range
-                if contrast < _V_MIN_CONTRAST:
-                    continue
-                thresh = center_val + 0.2 * (prof[rim_idx] - center_val)
-                above  = np.where(prof[1:rim_idx] > thresh)[0]
-                pit_r  = int(above[0]) + 1 if len(above) else 5
-                results.append(dict(cx=cx, cy=cy, kind='pit',
-                                    pit_r=pit_r, rim_r=rim_idx, contrast=contrast))
-            else:
-                moat_idx = int(np.argmin(prof[5:search_end])) + 5
-                drop     = (center_val - prof[moat_idx]) / ch_range
-                if drop < _V_MIN_CONTRAST or moat_idx + 5 >= search_end:
-                    continue
-                outer_idx = int(np.argmax(prof[moat_idx:search_end])) + moat_idx
-                rise      = (prof[outer_idx] - prof[moat_idx]) / ch_range
-                if rise < _V_MIN_CONTRAST * 0.5:
-                    continue
-                results.append(dict(cx=cx, cy=cy, kind='peak',
-                                    pit_r=moat_idx, rim_r=outer_idx, contrast=drop))
-
-    results.sort(key=lambda v: -v['contrast'])
-    unique = []
-    for v in results:
-        if not any(np.hypot(v['cx'] - u['cx'], v['cy'] - u['cy']) < 30 for u in unique):
-            unique.append(v)
-    return unique
-
-
-def _v_has_two_rings(v):
-    return v['pit_r'] > 0 and v['rim_r'] > v['pit_r'] * _V_RING_SEP_RATIO
-
-
-def _v_draw(canvas, volcanos):
-    for v in volcanos:
-        cx, cy  = v['cx'], v['cy']
-        pit_col = _V_PIT_COL if v['kind'] == 'pit' else _V_PEAK_COL
-        cv2.circle(canvas, (cx, cy), v['pit_r'], pit_col, 2)
-        cv2.circle(canvas, (cx, cy), v['rim_r'], _V_RIM_COL, 2)
-        cv2.circle(canvas, (cx, cy), 4, pit_col, -1)
-
-
-def _volcano_overlay(frame, live=False):
-    """Detect peak-type concentric rings (orange+magenta) in blue/red channels,
-    match them, and fall back to green peaks if no match.  Returns annotated BGR
-    frame.  Replaces _pupil_overlay / _focus_overlay."""
-    print("Detecting volcanoes...")
-    mr = _V_LIVE_MAX_RIM_R if live else _V_MAX_RIM_R
-    img_h, img_w = frame.shape[:2]
-
-    # Use the Purkinje reflection as the ROI centre (more precise than blur peak)
-    purkinje   = _detect_reflex(frame)
-    cx_hint    = purkinje[0] if purkinje else None
-    cy_hint    = purkinje[1] if purkinje else None
-
-    # Inpaint specular (Purkinje) reflection
-    spec_max  = np.max(frame, axis=2)
-    thresh    = np.percentile(spec_max, _V_SPECULAR_PCT)
-    spec_mask = (spec_max > thresh).astype(np.uint8)
-    spec_mask = cv2.dilate(spec_mask,
-                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
-    img = cv2.inpaint(frame, spec_mask, _V_INPAINT_R, cv2.INPAINT_TELEA)
-
-    # Restrict search to a box centred on the Purkinje spot (or brightest region)
-    roi_x1, roi_y1, roi_x2, roi_y2 = _find_roi(img, cx_hint, cy_hint)
-    roi = img[roi_y1:roi_y2, roi_x1:roi_x2]
-    roi_h, roi_w = roi.shape[:2]
-
-    def _off(vs):
-        """Offset ROI-relative coordinates back to full-frame space."""
-        return [{**v, 'cx': v['cx'] + roi_x1, 'cy': v['cy'] + roi_y1} for v in vs]
-
-    canvas = frame.copy()
-    # Draw ROI box so it's visible in the saved image
-    cv2.rectangle(canvas, (roi_x1, roi_y1), (roi_x2, roi_y2), (80, 80, 80), 1)
-    print("Detecting Blue volcanoes...")
-    blue_vs    = _off(_v_find_volcanos(roi[:, :, 0], roi_h, roi_w, mr))
-    print("Detecting Red volcanoes...")
-    red_vs     = _off(_v_find_volcanos(roi[:, :, 2], roi_h, roi_w, mr))
-    blue_peaks = [v for v in blue_vs if _v_has_two_rings(v) and v['kind'] == 'peak']
-    red_peaks  = [v for v in red_vs  if _v_has_two_rings(v) and v['kind'] == 'peak']
-
-    matches = []
-    print(f"Matching {len(blue_peaks)} blue peaks with {len(red_peaks)} red peaks...")
-    for bv in blue_peaks:
-        for rv in red_peaks:
-            if np.hypot(bv['cx'] - rv['cx'], bv['cy'] - rv['cy']) > _V_CENTRE_TOL:
-                continue
-            for attr in ('pit_r', 'rim_r'):
-                mean_r = (bv[attr] + rv[attr]) / 2
-                if mean_r == 0 or abs(bv[attr] - rv[attr]) / mean_r > _V_RING_SIZE_TOL:
-                    break
-            else:
-                matches.append((bv, rv))
-
-    if matches:
-        print("Plotting volcanoes...")
-        for bv, rv in matches:
-            cx  = (bv['cx']    + rv['cx'])    // 2
-            cy  = (bv['cy']    + rv['cy'])    // 2
-            p_r = (bv['pit_r'] + rv['pit_r']) // 2
-            r_r = (bv['rim_r'] + rv['rim_r']) // 2
-            cv2.circle(canvas, (bv['cx'], bv['cy']), bv['pit_r'], (255, 100,   0), 1)
-            cv2.circle(canvas, (bv['cx'], bv['cy']), bv['rim_r'], (255, 100,   0), 1)
-            cv2.circle(canvas, (rv['cx'], rv['cy']), rv['pit_r'], (  0,  80, 255), 1)
-            cv2.circle(canvas, (rv['cx'], rv['cy']), rv['rim_r'], (  0,  80, 255), 1)
-            cv2.circle(canvas, (cx, cy), p_r, (255, 255, 255), 2)
-            cv2.circle(canvas, (cx, cy), r_r, (255, 255, 255), 2)
-            cv2.circle(canvas, (cx, cy), 5,   (255, 255, 255), -1)
-            cv2.putText(canvas, f"match {p_r}/{r_r}px",
-                        (cx - 40, cy - r_r - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    else:
-        _v_draw(canvas, blue_peaks)
-        _v_draw(canvas, red_peaks)
-        green_vs    = _off(_v_find_volcanos(roi[:, :, 1], roi_h, roi_w, mr))
-        green_peaks = [v for v in green_vs
-                       if _v_has_two_rings(v) and v['kind'] == 'peak']
-        _v_draw(canvas, green_peaks)
-
-    return canvas
-'''
-
-
-def _find_contrast_roi(frame):
-    """Find the region where very bright and very dark areas coexist in the
-    blue/green channels.  This highlights the pupil boundary and Purkinje
-    reflex area while suppressing the red fundus glow.
-
-    Returns (x, y, w, h) as a square in frame coordinates, or None.
-    CROP_MARGIN multiplies the detected region size before returning.
-    """
-    h, w = frame.shape[:2]
-
-    # Blue + green only (channel 0 and 1 in BGR) — ignores red fundus glow
-    bg = frame[:, :, :2].mean(axis=2).astype(np.float32)
-
-    # Downsample 4× for speed
-    scale = 4
-    small = cv2.resize(bg, (w // scale, h // scale))
-    sh, sw = small.shape[:2]
-
-    vmin, vmax = float(small.min()), float(small.max())
-    if vmax - vmin < 8:          # image has no meaningful contrast
-        return None
-    norm = (small - vmin) / (vmax - vmin)
-
-    # Very bright / very dark masks
-    bright_mask = (norm > 0.80).astype(np.float32)
-    dark_mask   = (norm < 0.20).astype(np.float32)
-
-    # Spread each mask over a neighbourhood (~1/8 image width at downsampled scale)
-    nbr   = max(3, sw // 8)
-    ksize = nbr * 2 + 1
-    sigma = nbr / 2.5
-    bright_sp = cv2.GaussianBlur(bright_mask, (ksize, ksize), sigma)
-    dark_sp   = cv2.GaussianBlur(dark_mask,   (ksize, ksize), sigma)
-
-    # Co-presence map: high where both bright and dark exist nearby
-    co = bright_sp * dark_sp
-    if co.max() < 1e-6:
-        return None
-
-    # Bounding box of the high co-presence region (> 30 % of peak)
-    region = (co > co.max() * 0.30).astype(np.uint8)
-    pts = cv2.findNonZero(region)
-    if pts is None:
-        return None
-
-    rx, ry, rw, rh = cv2.boundingRect(pts)
-
-    # Reject implausibly tiny detections (< 60 px at full resolution)
-    if max(rw, rh) * scale < 60:
-        return None
-
-    # Scale back to full resolution
-    rx, ry, rw, rh = rx * scale, ry * scale, rw * scale, rh * scale
-
-    # Expand by CROP_MARGIN and make square
-    side = int(max(rw, rh) * CROP_MARGIN)
-    cx   = rx + rw // 2
-    cy   = ry + rh // 2
-    half = side // 2
-
-    x1 = max(0, cx - half)
-    y1 = max(0, cy - half)
-    x2 = min(w, x1 + side)
-    y2 = min(h, y1 + side)
-    x1 = max(0, x2 - side)
-    y1 = max(0, y2 - side)
-
-    return x1, y1, x2 - x1, y2 - y1
-
-
-def _find_change_roi(frame_before, frame_after):
-    """Find the region that was red in frame_before and turned dark in frame_after.
-    This corresponds to the zone where the dilated pupil's fundus glow was covered
-    by the constricting iris after the first flash.
-
-    Signal = (red_channel_before − luminance_after).clip(0): peaks where something
-    was reddish (fundus visible through open pupil) and is now dark (iris closed over it).
-
-    Returns (x, y, w, h) as a square in frame coordinates (expanded by
-    CROP_MARGIN), or None if the signal is too weak.
-    """
-    h, w = frame_before.shape[:2]
-
-    # Red channel before; overall luminance after
-    red_b = frame_before[:, :, 2].astype(np.float32)
-    lum_a = cv2.cvtColor(frame_after, cv2.COLOR_BGR2GRAY).astype(np.float32)
-
-    # Downsample 4× for speed and noise averaging
-    scale       = 4
-    small_red_b = cv2.resize(red_b,  (w // scale, h // scale))
-    small_lum_a = cv2.resize(lum_a,  (w // scale, h // scale))
-    sh, sw      = small_red_b.shape[:2]
-
-    # Signal: was red before AND is now dark — clips negative (got brighter) to zero
-    signal = (small_red_b - small_lum_a).clip(min=0)
-
-    if signal.max() < 8.0:          # no meaningful red-to-dark transition
-        return None
-
-    # Threshold at 30 % of peak
-    region = (signal > signal.max() * 0.30).astype(np.uint8)
-
-    # Morphological close to fill the hollow centre of the change ring so the
-    # bounding box spans the full pupil disc, not just the annulus edge.
-    k      = max(3, sw // 12)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, kernel)
-
-    pts = cv2.findNonZero(region)
-    if pts is None:
-        return None
-
-    rx, ry, rw, rh = cv2.boundingRect(pts)
-
-    # Reject implausibly tiny detections (< 60 px at full resolution)
-    if max(rw, rh) * scale < 60:
-        return None
-
-    # Scale back to full resolution
-    rx, ry, rw, rh = rx * scale, ry * scale, rw * scale, rh * scale
-
-    # Expand by CROP_MARGIN and make square
-    side = int(max(rw, rh) * CROP_MARGIN)
-    cx   = rx + rw // 2
-    cy   = ry + rh // 2
-    half = side // 2
-
-    x1 = max(0, cx - half)
-    y1 = max(0, cy - half)
-    x2 = min(w, x1 + side)
-    y2 = min(h, y1 + side)
-    x1 = max(0, x2 - side)
-    y1 = max(0, y2 - side)
-
-    return x1, y1, x2 - x1, y2 - y1
-
-
-def _detect_reflex(frame):
-    """Locate the pupil centre from the corneal LED reflex (near-white bright
-    spot) and estimate the pupil disc radius from the surrounding red/orange
-    fundus glow.  Using the specular reflection is more reliable than colour
-    alone because it is always at the pupil centre and is unaffected by the
-    diffuse LED ring on surrounding skin.
-
-    Returns (cx, cy, radius) in full-resolution coordinates, or None.
-    """
-    h, w = frame.shape[:2]
-    small = cv2.resize(frame, (w // 2, h // 2))
-    sh, sw = small.shape[:2]
-    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-
-    # ── 1. Corneal reflex: near-white, very bright ──────────────────────────
-    # V > 190, S < 120 → excludes coloured regions while catching a slightly
-    # pink-tinted LED reflection.
-    bright = cv2.inRange(hsv,
-                         np.array([0,   0, 190]),
-                         np.array([179, 120, 255]))
-    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, k3)
-    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN,  k3)
-
-    spot_cnts, _ = cv2.findContours(
-        bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    best_spot = None
-    best_sc   = 0.0
-    for c in spot_cnts:
-        a = cv2.contourArea(c)
-        if a < 3:
-            continue
-        p = cv2.arcLength(c, True)
-        if p < 1:
-            continue
-        circ = 4 * np.pi * a / (p * p)
-        sc = a * circ          # favour large AND circular blobs
-        if sc > best_sc:
-            best_sc   = sc
-            best_spot = c
-
-    if best_spot is None:
-        return None
-
-    (sx, sy), spot_r = cv2.minEnclosingCircle(best_spot)
-
-    # ── 2. Pupil disc from combined bright + fundus region ──────────────────
-    # The fundus glow visible through the dilated pupil is red/orange.
-    # Union with the bright spot then morphologically close to merge the two
-    # regions into one connected pupil disc, bridging the dark ring between
-    # the white specular spot and the surrounding reddish glow.
-    fund_lo = cv2.inRange(hsv, np.array([0,   40, 30]),
-                               np.array([25,  255, 255]))
-    fund_hi = cv2.inRange(hsv, np.array([155, 40, 30]),
-                               np.array([179, 255, 255]))
-    fundus = cv2.bitwise_or(fund_lo, fund_hi)
-
-    disc = cv2.bitwise_or(bright, fundus)
-    k_cl = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
-    disc = cv2.morphologyEx(disc, cv2.MORPH_CLOSE, k_cl)
-
-    disc_cnts, _ = cv2.findContours(
-        disc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    pupil_r_h = None
-    if disc_cnts:
-        # Pick the disc contour whose enclosing-circle centre is closest to
-        # the bright spot — rules out skin / optics artefacts far from centre.
-        def _dist_sq(c):
-            (x, y), _ = cv2.minEnclosingCircle(c)
-            return (x - sx) ** 2 + (y - sy) ** 2
-        c_disc = min(disc_cnts, key=_dist_sq)
-        _, r_cand = cv2.minEnclosingCircle(c_disc)
-        if r_cand > spot_r:   # disc must be larger than the spot itself
-            pupil_r_h = r_cand
-
-    if pupil_r_h is None:
-        # Fallback: corneal reflex is typically ~5-10 % of pupil diameter
-        pupil_r_h = max(spot_r * 5, 15)
-
-    return (int(sx * 2), int(sy * 2), max(int(pupil_r_h * 2), 10))
-
-
-def _pupil_overlay(frame):
-    """Fast live-feed overlay: orange circle around the detected corneal reflex."""
-    out = frame.copy()
-    result = _detect_reflex(frame)
-    if result is not None:
-        cx, cy, radius = result
-        cv2.circle(out, (cx, cy), radius, (0, 165, 255), 2)
-        cv2.circle(out, (cx, cy), 4, (0, 165, 255), -1)
-    return out
-
-
-def _focus_overlay(frame):
-    return _pupil_overlay(frame)
-
-
 def streaming_mode(picam2):
-    """Live video feed. Hold SPACE to turn LED on, r to lock/unlock.
-    f toggles reflex circle on live feed, v toggles volcano detection on captures.
-    Arrow keys rotate. Press ENTER or e to capture a still. Press s to exit."""
+    """Live video feed.
 
-    global LIVE_ROTATION, _last_roi, CROP_MARGIN
+    SPACE (hold) / r — flash LED (GPIO 17), hold / lock
+    a               — toggle ambient LED (GPIO 27)
+    p               — toggle live Orlosky pupil detection
+    ←/→             — rotate the live feed
+    ENTER or e      — capture an ambient + flash still
+    s               — exit streaming
+    """
+
+    global LIVE_ROTATION
 
     if not CV2_AVAILABLE:
         print("cv2 not available - cannot show live feed.")
         return
 
     print("\nStreaming mode ON")
-    print("SPACE=LED | r=lock | f=reflex-overlay | ←/→=rotate | [/]=crop | ENTER/e=capture | s=exit\n")
+    print("SPACE=flash | r=lock | a=ambient | p=pupil-detect | "
+          "←/→=rotate | ENTER/e=capture | s=exit\n")
 
     apply_camera_settings(picam2, FLASH_GAIN)
 
@@ -894,10 +959,10 @@ def streaming_mode(picam2):
     last_space_time = 0.0
     led_on = False
     lock_on = False
-    focus_overlay_on = False
-    _overlay_counter = 0
-    _overlay_cache   = None
-    _roi_counter     = 0
+    ambient_led_on = False
+    swirski_live_on = SWIRSKI_LIVE_DEFAULT
+    _detect_counter = 0
+    _overlay_cache = None
 
     try:
 
@@ -905,14 +970,6 @@ def streaming_mode(picam2):
 
             array = picam2.capture_array()
             frame = cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
-            # Periodically update the contrast ROI on the raw frame
-            # (unrotated sensor-space coords, used by capture_image for ScalerCrop)
-            # (CROPPING DISABLED)
-            # _roi_counter += 1
-            # if _roi_counter % _LIVE_OVERLAY_SKIP == 0:
-            #     _r = _find_contrast_roi(frame)
-            #     if _r is not None:
-            #         _last_roi = _r
             rot = _CV2_ROTATIONS[LIVE_ROTATION]
             if rot is not None:
                 frame = cv2.rotate(frame, rot)
@@ -921,13 +978,17 @@ def streaming_mode(picam2):
                 disp = cv2.resize(frame, (DISPLAY_W, DISPLAY_H))
             else:
                 disp = cv2.resize(frame, (DISPLAY_H, DISPLAY_W))
-            if focus_overlay_on:
-                _overlay_counter += 1
+
+            # Live Swirski pupil detection — recompute every N frames
+            if swirski_live_on:
+                _detect_counter += 1
                 if (_overlay_cache is None
-                        or _overlay_cache.shape != disp.shape
-                        or _overlay_counter % _LIVE_OVERLAY_SKIP == 0):
-                    _overlay_cache = _pupil_overlay(disp)
-                disp = _overlay_cache
+                        or _detect_counter % _LIVE_DETECT_SKIP == 0):
+                    gray = cv2.cvtColor(disp, cv2.COLOR_BGR2GRAY)
+                    _overlay_cache = detect_pupil(gray, live=True)
+                if _overlay_cache:
+                    disp = _draw_overlays(disp.copy(), _overlay_cache)
+
             cv2.imshow(WINDOW_NAME, disp)
 
             key = cv2.waitKeyEx(1)
@@ -947,10 +1008,10 @@ def streaming_mode(picam2):
                 led_on = False
                 last_space_time = 0.0
                 capture_image(picam2)
-                # Annotate saved preview with reflex overlay
-                _saved = cv2.imread(PHOTO_PATH)
-                if _saved is not None:
-                    cv2.imwrite(PHOTO_PATH, _focus_overlay(_saved))
+                # capture_image manages both LEDs itself; restore the ambient
+                # LED to whatever state streaming had it in
+                if ambient_led_on:
+                    ambient_on()
                 apply_camera_settings(picam2, FLASH_GAIN)
 
             # Track spacebar hold via auto-repeat
@@ -958,14 +1019,25 @@ def streaming_mode(picam2):
                 last_space_time = now
                 space_held = True
 
-            # r toggles LED lock
+            # r toggles flash LED lock
             elif key == ord('r'):
                 lock_on = not lock_on
 
-            # f toggles reflex circle on live feed
-            elif key == ord('f'):
-                focus_overlay_on = not focus_overlay_on
-                print(f"Reflex overlay (live): {'ON' if focus_overlay_on else 'OFF'}")
+            # a toggles the ambient LED (GPIO 27)
+            elif key == ord('a'):
+                ambient_led_on = not ambient_led_on
+                if ambient_led_on:
+                    ambient_on()
+                else:
+                    ambient_off()
+                print(f"Ambient LED: {'ON' if ambient_led_on else 'OFF'}")
+
+            # p toggles live Swirski pupil detection
+            elif key == ord('p'):
+                swirski_live_on = not swirski_live_on
+                _overlay_cache = None
+                print(f"Live pupil detection: "
+                      f"{'ON' if swirski_live_on else 'OFF'}")
 
             # Arrow keys: left=CCW step, right=CW step
             elif key == 65361:  # left arrow
@@ -974,14 +1046,6 @@ def streaming_mode(picam2):
             elif key == 65363:  # right arrow
                 LIVE_ROTATION = (LIVE_ROTATION + 1) % 4
                 print(f"Rotation: {LIVE_ROTATION * 90}°")
-
-            # [ / ] adjust crop margin
-            elif key == ord('['):
-                CROP_MARGIN = max(0.5, round(CROP_MARGIN - 0.5, 1))
-                print(f"Crop margin: {CROP_MARGIN}×")
-            elif key == ord(']'):
-                CROP_MARGIN = round(CROP_MARGIN + 0.5, 1)
-                print(f"Crop margin: {CROP_MARGIN}×")
 
             should_be_on = lock_on or space_held
             if should_be_on and not led_on:
@@ -994,6 +1058,7 @@ def streaming_mode(picam2):
     finally:
 
         flash_off()
+        ambient_off()
         apply_camera_settings(picam2, LIVE_GAIN)
         cv2.destroyWindow(WINDOW_NAME)
         print("Streaming mode OFF.\n")
@@ -1010,14 +1075,12 @@ def handle_parameter_command(cmd, picam2):
 
     global FLASH_PRE_DELAY
     global FLASH_POST_DELAY
-
-    global FLASH1_DURATION
-    global FLASH_GAP
-    global FLASH2_DURATION
+    global FLASH_DURATION
 
     global BRIGHTNESS
     global CONTRAST
-    global CROP_MARGIN
+    global DETECT_EXCLUDE_BOTTOM
+    global SWIRSKI_DEBUG
 
     parts = cmd.split()
 
@@ -1075,14 +1138,8 @@ def handle_parameter_command(cmd, picam2):
         elif param == "post_delay":
             FLASH_POST_DELAY = float(value)
 
-        elif param == "flash1_duration":
-            FLASH1_DURATION = float(value)
-
-        elif param == "flash_gap":
-            FLASH_GAP = float(value)
-
-        elif param == "flash2_duration":
-            FLASH2_DURATION = float(value)
+        elif param == "flash_duration":
+            FLASH_DURATION = float(value)
 
         # Image processing
 
@@ -1092,8 +1149,13 @@ def handle_parameter_command(cmd, picam2):
         elif param == "contrast":
             CONTRAST = float(value)
 
-        elif param == "crop_margin":
-            CROP_MARGIN = float(value)
+        # Pupil detection
+
+        elif param == "exclude_bottom":
+            DETECT_EXCLUDE_BOTTOM = min(0.9, max(0.0, float(value)))
+
+        elif param == "debug":
+            SWIRSKI_DEBUG = bool(int(value))
 
         else:
             print("Unknown parameter.")
@@ -1160,8 +1222,9 @@ def main():
 
     print_settings()
 
-    print("ENTER = capture")
-    print("s     = streaming mode (SPACE=LED, r=lock, f=focus, e/ENTER=capture)")
+    print("ENTER = capture (ambient + flash, with pupil detection)")
+    print("s     = streaming mode (SPACE=flash, r=lock, a=ambient, "
+          "p=pupil-detect, e/ENTER=capture)")
     print("q     = quit\n")
 
     # ───────── MAIN LOOP ─────────
