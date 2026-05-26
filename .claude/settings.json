@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python test_pupil_detection.py)",
+      "PowerShell($cmds = @\\(\"python\",\"python3\",\"py\"\\); foreach \\($c in $cmds\\) { $g = Get-Command $c -ErrorAction SilentlyContinue; if \\($g\\) { Write-Output \"$c -> $\\($g.Source\\)\" } })"
+    ]
+  }
+}

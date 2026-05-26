@@ -5,9 +5,15 @@ Raspberry Pi Zero + Camera Module V2
 
 CONTROLS
 ────────
+The program boots straight into streaming mode.  Exiting streaming (s) drops
+into a command prompt:
+
 ENTER               Capture photo (ambient + flash pair)
-s + ENTER           Streaming mode
+s + ENTER           Re-enter streaming mode
 q + ENTER           Quit
+
+Each capture's raw ambient + flash pair is also pushed to the dev machine's
+Transfers folder via scp, for offline pupil-detection testing.
 
 Streaming mode
 ──────────────
@@ -46,12 +52,22 @@ exclude_bottom 0.0
 debug 1
 """
 
-from picamera2 import Picamera2
 import time
 import os
 import sys
+import json
+import urllib.request
+import urllib.error
+from datetime import datetime
 from PIL import Image, ImageEnhance
 import numpy as np
+
+try:
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
+except ImportError:
+    PICAMERA2_AVAILABLE = False
+    print("Warning: picamera2 not available.")
 
 try:
     import RPi.GPIO as GPIO
@@ -75,6 +91,17 @@ LED_PIN_2 = 27     # ambient LED — diffuse light for pupil detection
 PHOTO_PATH   = "/tmp/retina_preview.jpg"   # annotated flash photo
 AMBIENT_PATH = "/tmp/retina_ambient.jpg"   # raw ambient image (Swirski input)
 
+# ───────── IMAGE TRANSFER ─────────
+# Each capture's raw ambient + flash pair is HTTP-POSTed to the dev machine's
+# receiver.py, which writes them into its Transfers/ folder for offline
+# pupil-detection testing.  The Pi joins the dev machine's Windows mobile
+# hotspot; the machine is the hotspot gateway.
+TRANSFER_ENABLED  = True
+REMOTE_HOST       = "192.168.137.1"        # Windows hotspot gateway IP
+REMOTE_PORT       = 8000                   # must match receiver.py
+LOCAL_STAGING_DIR = "/tmp/eyevu_transfers"  # capture folders staged here first
+TRANSFER_TIMEOUT  = 10                     # seconds per HTTP request
+
 # Reduced slightly from 1640x1232
 # Faster on Pi Zero while still sharp
 CAMERA_WIDTH = 1280
@@ -93,6 +120,12 @@ BLUE_GAIN = 1.4
 FLASH_PRE_DELAY = 0.05
 FLASH_POST_DELAY = 0.05
 FLASH_DURATION = 0.075
+
+# Frame-drain — picamera2 buffers a couple of frames; after flipping an LED or
+# changing the gain the first frame returned by capture_array() may still be a
+# stale exposure under the previous state (visible as dark flash photos).  We
+# discard this many frames after each state change before the keeper capture.
+FLUSH_FRAMES = 2
 
 # Image processing
 BRIGHTNESS = 2.0
@@ -243,6 +276,12 @@ _ORL_DARKEST_WIN = 20            # window size for the darkest-region search
 _ORL_DILATE_KERNEL = 5           # dilation kernel side
 _ORL_DILATE_ITERS = 2            # dilation iterations
 
+# ── Reflection inpainting — remove bright specular artefacts (corneal LED
+#    reflexes) before detection so they do not punch holes in the dark pupil ──
+_INPAINT_BRIGHT_THRESH = 220     # pixels brighter than this are specular
+_INPAINT_DILATE = 7              # dilate the reflection mask to cover the halo
+_INPAINT_RADIUS = 5              # cv2.inpaint neighbourhood radius
+
 # Flash-LED-cover exclusion — the LED's physical cover intrudes into the frame
 # as a large near-black blob.  It is detected dynamically (a large,
 # border-touching, very dark region); DETECT_EXCLUDE_BOTTOM is an optional
@@ -294,14 +333,38 @@ def _find_led_cover_mask(gray):
 
 
 def _apply_exclusions(gray):
-    """Return a copy of `gray` with the flash-LED cover (detected dynamically)
-    and the optional manual bottom band blanked to white (255), so they cannot
-    be mistaken for a dark pupil."""
+    """Return a copy of `gray` restricted to the central search strip.
+
+    The flash-LED cover intrudes from the bottom of the (rotated) frame.  The
+    search is limited to a horizontal band centred on the image middle: its
+    lower edge is the top edge of the LED cover, and its upper edge is the
+    mirror of that same distance above the middle.  Everything outside the
+    strip is blanked to white (255) so it cannot be mistaken for a dark pupil.
+
+    If no LED cover is detected, the optional manual DETECT_EXCLUDE_BOTTOM band
+    is used as a fallback.
+    """
     h = gray.shape[0]
+    mid = h // 2
     g = gray.copy()
+
     cover = _find_led_cover_mask(g)
     if cover is not None:
-        g[cover > 0] = 255
+        rows = np.where(cover.any(axis=1))[0]
+        if len(rows) > 0:
+            led_top = int(rows.min())          # cover edge nearest the middle
+            half = led_top - mid               # distance middle → cover edge
+            if half > 0:
+                # symmetric strip about the middle, full image width
+                g[:mid - half, :] = 255        # upper side (mirror band)
+                g[mid + half:, :] = 255        # LED-cover side
+                return g
+            # cover reaches past the middle — blank it and everything below
+            g[cover > 0] = 255
+            g[led_top:, :] = 255
+            return g
+
+    # fallback — no LED cover found: optional manual bottom band only
     if DETECT_EXCLUDE_BOTTOM > 0:
         y_ex = int(h * (1.0 - min(0.9, DETECT_EXCLUDE_BOTTOM)))
         g[y_ex:, :] = 255
@@ -725,6 +788,23 @@ def _orlosky_contours(gray):
     return contours, darkest
 
 
+def _inpaint_reflections(gray):
+    """Inpaint bright specular reflection artefacts (corneal LED reflexes).
+
+    These near-saturated spots sit on top of the dark pupil and would punch
+    bright holes through the threshold mask, breaking the pupil contour.
+    Returns the repaired grayscale image (unchanged if no reflections found).
+    """
+    _, bright = cv2.threshold(gray, _INPAINT_BRIGHT_THRESH, 255,
+                              cv2.THRESH_BINARY)
+    if int(cv2.countNonZero(bright)) == 0:
+        return gray
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                  (_INPAINT_DILATE, _INPAINT_DILATE))
+    bright = cv2.dilate(bright, k)          # cover the soft reflection halo
+    return cv2.inpaint(gray, bright, _INPAINT_RADIUS, cv2.INPAINT_TELEA)
+
+
 def detect_pupil(gray, live=False):
     """Detect the pupil with the Orlosky method.
 
@@ -737,6 +817,9 @@ def detect_pupil(gray, live=False):
         return []
     if gray.ndim != 2:
         gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+
+    # Inpaint bright specular reflections before any Orlosky processing
+    gray = _inpaint_reflections(gray)
 
     # Blank the flash-LED cover so the darkest-area search ignores it
     gray = _apply_exclusions(gray)
@@ -849,6 +932,106 @@ def process_image(array, overlays=None):
     return img
 
 
+def detect_and_annotate(ambient_array, flash_array):
+    """Detect the pupil in the ambient image and annotate the flash image.
+
+    Detection runs in the display (rotated) orientation so its result lines up
+    with the rotated flash photo that process_image() produces.  Returns
+    (annotated_PIL_image, overlays).  Shared by capture_image() and the offline
+    test harness (test_pupil_detection.py) so detection is identical in both.
+    """
+    overlays = []
+    if CV2_AVAILABLE:
+        amb_bgr = cv2.cvtColor(ambient_array, cv2.COLOR_RGB2BGR)
+        rot = _CV2_ROTATIONS[LIVE_ROTATION]
+        if rot is not None:
+            amb_bgr = cv2.rotate(amb_bgr, rot)
+        gray = cv2.cvtColor(amb_bgr, cv2.COLOR_BGR2GRAY)
+        overlays = detect_pupil(gray)
+    img = process_image(flash_array, overlays)
+    return img, overlays
+
+
+def transfer_capture(ambient_array, flash_array):
+    """Stage the raw capture pair locally and POST it to the dev machine.
+
+    Writes LOCAL_STAGING_DIR/capture_<timestamp>/{ambient.jpg, flash.jpg,
+    meta.json}, then uploads each file via HTTP POST to receiver.py on the dev
+    machine.  The raw images are saved (no overlay) so the test harness can
+    re-run detection cleanly; meta.json records LIVE_ROTATION so the test
+    rotates exactly as the Pi did.
+
+    Any failure is reported on the Pi but never raised — a transfer problem
+    must not interrupt capture or streaming.
+    """
+    if not TRANSFER_ENABLED:
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder = os.path.join(LOCAL_STAGING_DIR, f"capture_{stamp}")
+
+    # ── stage the pair locally ──
+    try:
+        os.makedirs(folder, exist_ok=True)
+        Image.fromarray(ambient_array).save(os.path.join(folder, "ambient.jpg"))
+        Image.fromarray(flash_array).save(os.path.join(folder, "flash.jpg"))
+        meta = {
+            "timestamp":     stamp,
+            "live_rotation": LIVE_ROTATION,
+            "exposure":      EXPOSURE_TIME,
+            "flash_gain":    FLASH_GAIN,
+            "red_gain":      RED_GAIN,
+            "blue_gain":     BLUE_GAIN,
+            "brightness":    BRIGHTNESS,
+            "contrast":      CONTRAST,
+            "swirski_debug": SWIRSKI_DEBUG,
+        }
+        with open(os.path.join(folder, "meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+    except OSError as e:
+        print(f"[TRANSFER ERROR] could not stage capture: {e}")
+        return
+
+    # ── upload each file to receiver.py on the dev machine ──
+    folder_name = f"capture_{stamp}"
+    base_url = f"http://{REMOTE_HOST}:{REMOTE_PORT}/upload/{folder_name}"
+    failed = False
+    for fname in ("ambient.jpg", "flash.jpg", "meta.json"):
+        path = os.path.join(folder, fname)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            req = urllib.request.Request(
+                f"{base_url}/{fname}",
+                data=data, method="POST",
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            with urllib.request.urlopen(req, timeout=TRANSFER_TIMEOUT) as resp:
+                if resp.status != 200:
+                    print(f"[TRANSFER ERROR] {fname}: HTTP {resp.status}")
+                    failed = True
+        except (urllib.error.URLError, OSError) as e:
+            # URLError covers HTTPError, connection refused, DNS, timeout.
+            print(f"[TRANSFER ERROR] {fname}: {e}")
+            failed = True
+
+    if not failed:
+        print(f"Transferred {folder_name} to {REMOTE_HOST}.")
+
+
+def _drain_frames(picam2, n=FLUSH_FRAMES):
+    """Discard the next n frames from the camera.
+
+    picam2.capture_array() may return a frame that was already in the buffer,
+    exposed under the *previous* state — wrong gain, or LED not yet on.  After
+    flipping a GPIO LED or changing the gain, drain a couple of frames so the
+    following capture is a fresh exposure under the new state.  Without this,
+    the saved flash photo is often dark.
+    """
+    for _ in range(n):
+        picam2.capture_array()
+
+
 def capture_image(picam2):
     """Capture a flash + ambient image pair and detect the pupil.
 
@@ -866,10 +1049,12 @@ def capture_image(picam2):
 
     apply_camera_settings(picam2, FLASH_GAIN)
     time.sleep(0.02)
+    _drain_frames(picam2)              # let the new gain take effect
 
     # ───────── FLASH IMAGE (GPIO 17) — first, pupil still dilated ─────────
     flash_on()
     time.sleep(FLASH_PRE_DELAY)
+    _drain_frames(picam2)              # flush frames exposed before LED on
     flash_array = picam2.capture_array()
     time.sleep(FLASH_DURATION)
     flash_off()
@@ -878,6 +1063,7 @@ def capture_image(picam2):
     # ───────── AMBIENT IMAGE (GPIO 27) — second ─────────
     ambient_on()
     time.sleep(FLASH_PRE_DELAY)
+    _drain_frames(picam2)              # flush frames exposed before LED on
     ambient_array = picam2.capture_array()
     ambient_off()
 
@@ -887,24 +1073,20 @@ def capture_image(picam2):
     # Save the raw ambient image for inspection
     Image.fromarray(ambient_array).save(AMBIENT_PATH)
 
-    # ───────── PUPIL DETECTION (Swirski) ─────────
-    # Detection runs in the display (rotated) orientation so its result lines
-    # up with the rotated flash photo that process_image() produces.
-    overlays = []
+    # ───────── IMAGE TRANSFER ─────────
+    # Push the raw pair to the dev machine for offline detection testing.
+    transfer_capture(ambient_array, flash_array)
+
+    # ───────── PUPIL DETECTION (Orlosky) ─────────
     if CV2_AVAILABLE:
-        amb_bgr = cv2.cvtColor(ambient_array, cv2.COLOR_RGB2BGR)
-        rot = _CV2_ROTATIONS[LIVE_ROTATION]
-        if rot is not None:
-            amb_bgr = cv2.rotate(amb_bgr, rot)
-        gray = cv2.cvtColor(amb_bgr, cv2.COLOR_BGR2GRAY)
-        overlays = detect_pupil(gray)
+        img, overlays = detect_and_annotate(ambient_array, flash_array)
         if not overlays:
             print("No pupil candidates detected.")
     else:
         print("cv2 not available - pupil detection skipped.")
+        img = process_image(flash_array, [])
 
-    # Process the flash image, drawing the pupil candidate overlay(s)
-    img = process_image(flash_array, overlays)
+    # Save the annotated flash photo
     img.save(PHOTO_PATH)
 
     print("Captured.")
@@ -1222,14 +1404,25 @@ def main():
 
     print_settings()
 
-    print("ENTER = capture (ambient + flash, with pupil detection)")
-    print("s     = streaming mode (SPACE=flash, r=lock, a=ambient, "
-          "p=pupil-detect, e/ENTER=capture)")
-    print("q     = quit\n")
-
-    # ───────── MAIN LOOP ─────────
+    # ───────── BOOT STRAIGHT INTO STREAMING MODE ─────────
+    # The program always starts streaming; exiting streaming (s) drops into the
+    # normal command loop below, from which streaming can be re-entered.
 
     try:
+
+        streaming_mode(picam2)
+        try:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIOFLUSH)
+        except Exception:
+            pass
+
+        print("ENTER = capture (ambient + flash, with pupil detection)")
+        print("s     = streaming mode (SPACE=flash, r=lock, a=ambient, "
+              "p=pupil-detect, e/ENTER=capture)")
+        print("q     = quit\n")
+
+        # ───────── MAIN LOOP ─────────
 
         while True:
 
