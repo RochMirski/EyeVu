@@ -262,19 +262,82 @@ def print_settings():
 
 SWIRSKI_LIVE_DEFAULT  = False    # live-mode detection off by default
 
-# ── Swirski detector parameters (commented out — using Orlosky instead) ──
-# _SW_MIN_R_FRAC = 0.03 ; _SW_MAX_R_FRAC = 0.13 ; _SW_N_RADII = 6
-# _SW_COARSE_DOWNSCALE = 4 ; _SW_RANSAC_ITERS = 40 ; _SW_RANSAC_ITERS_LIVE = 12
-# _SW_INLIER_DIST = 2.0 ; _SW_MIN_SOLIDITY = 0.80 ; _SW_MAX_AXIS_RATIO = 2.2
+# ── Swirski Haar coarse-seed parameters (the dark-centre/light-surround
+#    response seeds the Orlosky pipeline; the rest of Swirski stays commented) ──
+_SW_MIN_R_FRAC = 0.03            # min pupil radius, as a fraction of min(h, w)
+_SW_MAX_R_FRAC = 0.13            # max pupil radius, as a fraction of min(h, w)
+_SW_N_RADII = 6                  # number of candidate radii to test
+_SW_COARSE_DOWNSCALE = 4         # downscale factor for the cheap coarse search
+
+# ── Swirski RANSAC ellipse-fit parameters (used by _swirski_fit_ellipse /
+#    _swirski_support — the gradient-aware fit that tolerates a partially
+#    occluded pupil boundary) ──
+_SW_INLIER_DIST = 2.5            # px — boundary point counts as an inlier if this
+                                 # close to the candidate ellipse
+_SW_RANSAC_ITERS = 120           # RANSAC hypotheses (offline / capture mode)
+_SW_RANSAC_ITERS_LIVE = 30       # fewer hypotheses for streaming-mode speed
+_SW_MAX_AXIS_RATIO = 2.5         # reject ellipses more elongated than this
+
+# ── Corneal-reflex anchor — the bright specular spot sits on/beside the pupil
+#    centre and is the most reliable seed; a large dark surround distinguishes
+#    it from the diffuse light-leak glow and from sclera/skin reflections ──
+_REFLEX_BRIGHT_PCTILE = 99.5     # brightness percentile for specular candidates
+_REFLEX_MIN_AREA = 4             # px — ignore single-pixel noise specks
+_REFLEX_MAX_AREA_FRAC = 0.01     # max blob area (fraction of frame) — reflex is small
+_REFLEX_MIN_FILL = 0.35          # min bbox fill — reflex is compact, glow is ragged
+_PUPIL_ROI_R_MULT = 2.6          # detection ROI half-side = this x max pupil radius
+
+# ── Radial pupil-boundary search (anchored at the reflex) ──
+# Cast rays out from the anchor; the pupil edge is the strongest dark->light
+# rise per ray.  Rays into the dark occluder patch show no rise and are dropped,
+# so the ellipse is fit from the visible iris-side arc only.
+_RAD_N_ANGLES = 96               # number of rays cast from the anchor
+_RAD_SEARCH_MULT = 1.15          # search radius = this x max pupil radius (kept
+                                 # tight so a ray stops at the pupil edge and does
+                                 # not run on to the much brighter lower eyelid)
+_RAD_GRAD_K = 2.2                # a ray's peak outward gradient must exceed this x
+                                 # its own mean |gradient| to count as a boundary
+                                 # ridge (per-ray, so contrast/illumination-robust)
+_RAD_INLIER_PX = 9.0             # px — edge point counts toward the fit if this close
+_RAD_RECENTRE_ITERS = 5          # radial-fit recentring passes (reflex is at the
+                                 # pupil edge, so the centre must be iterated)
+_RAD_MIN_COVER = 0.30            # min fraction of rays that must hit an edge — too
+                                 # few means the boundary arc is too short to trust
+
+# ── Concentric iris refinement — pupil and iris share a centre; the larger iris
+#    arc stabilises the common centre (see _fit_concentric) ──
+_IRIS_RP_MIN = 1.3               # iris radius must be at least this x pupil radius
+_IRIS_RP_MAX = 5.0               # ...and at most this x (else it is not the iris)
+_IRIS_SEARCH_MAX = 4.5           # search the iris ridge out to this x pupil radius
+_IRIS_MIN_COVER = 0.35           # min iris-arc coverage before trusting the refine
+_IRIS_MAX_RMS_FRAC = 0.10        # iris points must lie on a circle to this RMS
+                                 # (fraction of iris radius), else they are noise
+
+# ── Flash red-eye (retroreflection) detection + ambient/flash fusion ──
+_REDEYE_WIN_MULT = 1.8           # search the flash glow within this x max pupil
+                                 # radius of the ambient reflex anchor
+_REDEYE_BLUE_SUB = 0.4           # red-weighting: glow map = R - this x B
+_REDEYE_MIN_PEAK = 70            # min glow peak to consider a candidate at all
+_REDEYE_TRUST = 120              # glow peak above which the red-eye is trusted to
+                                 # override a disagreeing ambient fit
+_AMBIENT_MIN_CONF = 0.25         # ambient fit confidence (coverage x inlier frac)
+                                 # below which the result is flagged low-confidence
 
 # ── Orlosky detector parameters ──
 _ORL_THRESHOLD_OFFSET = 15       # binary threshold = darkest pixel value + this
 _ORL_MASK_FRAC = 0.5             # ROI square side, as a fraction of min(h, w)
+_ORL_ROI_R_MULT = 4.0            # ROI square side = this × Haar seed radius
+_ORL_SEED_WIN_MULT = 1.0         # seed threshold patch half-size = this × radius
 _ORL_MIN_AREA_FRAC = 0.003       # min contour area, as a fraction of frame area
 _ORL_MAX_RATIO = 3.0             # max contour bounding-box aspect ratio
 _ORL_DARKEST_WIN = 20            # window size for the darkest-region search
 _ORL_DILATE_KERNEL = 5           # dilation kernel side
 _ORL_DILATE_ITERS = 2            # dilation iterations
+
+# ── CLAHE contrast boost — lift the pupil/iris edge out of the eye-socket
+#    shadow before thresholding ──
+_CLAHE_CLIP = 2.0                # CLAHE clip limit
+_CLAHE_TILE = 8                  # CLAHE tile grid side
 
 # ── Reflection inpainting — remove bright specular artefacts (corneal LED
 #    reflexes) before detection so they do not punch holes in the dark pupil ──
@@ -288,6 +351,9 @@ _INPAINT_RADIUS = 5              # cv2.inpaint neighbourhood radius
 # manual fallback band (see handle_parameter_command's `exclude_bottom`).
 _LED_DARK_THRESH = 30            # intensity below which a pixel is "near-black"
 _LED_MIN_AREA_FRAC = 0.05        # min blob area (fraction of frame) to qualify
+_LED_MAX_AREA_FRAC = 0.45        # max blob area — bigger means the cover has
+                                 # merged with the eye-socket shadow; skip it
+                                 # rather than blanking half the eye
 DETECT_EXCLUDE_BOTTOM = 0.0      # manual fallback: blank this bottom fraction
 
 # Live mode: only recompute the detection every N frames
@@ -296,6 +362,34 @@ _LIVE_DETECT_SKIP = 5
 # Debug — annotate EVERY detected pupil candidate (no plausibility filtering)
 # instead of a single filtered result.  Toggle at runtime with `debug 0` / `debug 1`.
 SWIRSKI_DEBUG = True
+
+# Per-stage debug sink.  When this is a list, detect_pupil() appends a
+# (stage_name, BGR_image) tuple after every pipeline stage so the caller can
+# write them out (the offline harness turns these into stage_*.jpg or a montage).
+# Leave as None in normal/live operation — _dbg() is then a no-op.
+PUPIL_DEBUG_STAGES = None
+
+# Stashed result of the last ambient detect_pupil() call, for ambient/flash
+# fusion in detect_and_annotate().  (cx, cy) is the reflex anchor; pupil is
+# (cx, cy, r) or None; conf in [0, 1] from edge coverage x inlier tightness.
+_LAST_ANCHOR = None
+_LAST_PUPIL = None
+_LAST_CONF = 0.0
+
+
+def _dbg(name, img):
+    """Record an intermediate pipeline image for visual debugging.
+
+    No-op unless PUPIL_DEBUG_STAGES is a list.  Grayscale inputs are promoted to
+    BGR so every recorded stage can be written/montaged uniformly.
+    """
+    if PUPIL_DEBUG_STAGES is None:
+        return
+    if img.ndim == 2:
+        out = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    else:
+        out = img.copy()
+    PUPIL_DEBUG_STAGES.append((name, out))
 
 
 def _find_led_cover_mask(gray):
@@ -327,42 +421,35 @@ def _find_led_cover_mask(gray):
 
     if not found:
         return None
+    # If the total dark border-region is implausibly large, the cover has fused
+    # with the eye-socket shadow and dark iris into one mass.  Blanking it would
+    # erase the pupil's lighter surround (and the pupil itself), so treat it as
+    # "no reliable cover" and skip exclusion entirely.
+    if int(mask.sum()) / 255 > _LED_MAX_AREA_FRAC * h * w:
+        return None
     # grow slightly — the out-of-focus cover has a soft, fuzzy edge
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     return cv2.dilate(mask, k)
 
 
 def _apply_exclusions(gray):
-    """Return a copy of `gray` restricted to the central search strip.
+    """Return a copy of `gray` with the flash-LED cover blanked to white.
 
-    The flash-LED cover intrudes from the bottom of the (rotated) frame.  The
-    search is limited to a horizontal band centred on the image middle: its
-    lower edge is the top edge of the LED cover, and its upper edge is the
-    mirror of that same distance above the middle.  Everything outside the
-    strip is blanked to white (255) so it cannot be mistaken for a dark pupil.
+    The cover is a large, border-touching, near-black blob that can intrude
+    from any edge of the (rotated) frame.  Its 2D mask is whited out (255) so
+    it can never be mistaken for a dark pupil — no assumption is made about
+    which edge it enters from.
 
     If no LED cover is detected, the optional manual DETECT_EXCLUDE_BOTTOM band
     is used as a fallback.
     """
     h = gray.shape[0]
-    mid = h // 2
     g = gray.copy()
 
     cover = _find_led_cover_mask(g)
     if cover is not None:
-        rows = np.where(cover.any(axis=1))[0]
-        if len(rows) > 0:
-            led_top = int(rows.min())          # cover edge nearest the middle
-            half = led_top - mid               # distance middle → cover edge
-            if half > 0:
-                # symmetric strip about the middle, full image width
-                g[:mid - half, :] = 255        # upper side (mirror band)
-                g[mid + half:, :] = 255        # LED-cover side
-                return g
-            # cover reaches past the middle — blank it and everything below
-            g[cover > 0] = 255
-            g[led_top:, :] = 255
-            return g
+        g[cover > 0] = 255                     # white-out the cover, wherever it is
+        return g
 
     # fallback — no LED cover found: optional manual bottom band only
     if DETECT_EXCLUDE_BOTTOM > 0:
@@ -727,6 +814,82 @@ def swirski_detect(gray, live=False):
 
 # ───────── ORLOSKY DETECTOR — active ─────────
 
+def _swirski_coarse(gray, rmin, rmax):
+    """Stage 1 — Haar-like coarse pupil detection (dark centre / light ring).
+
+    The pupil is a dark disc surrounded by a lighter iris.  For each candidate
+    radius (rmin..rmax) we evaluate, at every pixel, (mean of a surrounding box)
+    − (mean of a central box); the pupil centre maximises this response.  A flat
+    dark region (LED cover, eye-socket shadow) has no light surround and scores
+    low, so this seeds the pupil far more reliably than a plain darkest-pixel
+    search.  Box means are O(1) via cv2.boxFilter, so a handful of radii is cheap.
+
+    Returns (cx, cy, r) in `gray` coordinates, or None.
+    """
+    h, w = gray.shape[:2]
+    ds = _SW_COARSE_DOWNSCALE
+    small = cv2.resize(gray, (max(1, w // ds), max(1, h // ds)))
+    small = small.astype(np.float32)
+    sh, sw = small.shape[:2]
+
+    best_resp = -1e9
+    best = None
+    for r in np.linspace(rmin, rmax, _SW_N_RADII):
+        rs = max(1, int(r / ds))          # pupil-scale box half-size
+        inner_k = rs * 2 + 1
+        outer_k = rs * 6 + 1              # 3x scale surround
+        m = rs * 3                        # border to keep both boxes in-frame
+        if outer_k >= min(sh, sw) or m * 2 >= min(sh, sw):
+            continue
+
+        inner = cv2.boxFilter(small, -1, (inner_k, inner_k),
+                              normalize=True, borderType=cv2.BORDER_REPLICATE)
+        outer = cv2.boxFilter(small, -1, (outer_k, outer_k),
+                              normalize=True, borderType=cv2.BORDER_REPLICATE)
+
+        # surround mean = (outer*outer_area - inner*inner_area) / surround_area
+        ia = float(inner_k * inner_k)
+        oa = float(outer_k * outer_k)
+        surround = (outer * oa - inner * ia) / (oa - ia)
+        resp = surround - inner           # large where centre dark, ring light
+
+        roi = resp[m:sh - m, m:sw - m]
+        _, mx, _, mx_loc = cv2.minMaxLoc(roi)
+        if mx > best_resp:
+            best_resp = mx
+            cx = (mx_loc[0] + m) * ds
+            cy = (mx_loc[1] + m) * ds
+            best = (int(cx), int(cy), int(r))
+
+    return best
+
+
+def _enhance_contrast(gray):
+    """Apply CLAHE to lift the pupil/iris edge out of the eye-socket shadow."""
+    clahe = cv2.createCLAHE(clipLimit=_CLAHE_CLIP,
+                            tileGridSize=(_CLAHE_TILE, _CLAHE_TILE))
+    return clahe.apply(gray)
+
+
+def _orlosky_seed(gray):
+    """Coarse seed for the Orlosky pipeline.
+
+    Prefers the Swirski Haar dark-centre/light-surround response; falls back to
+    the plain darkest-area search if no Haar response is found.  Returns
+    (cx, cy, r) — r is None for the darkest-area fallback.
+    """
+    h, w = gray.shape[:2]
+    rmin = _SW_MIN_R_FRAC * min(h, w)
+    rmax = _SW_MAX_R_FRAC * min(h, w)
+    coarse = _swirski_coarse(gray, rmin, rmax)
+    if coarse is not None:
+        return coarse
+    darkest = _orlosky_darkest_area(gray)
+    if darkest is None:
+        return None
+    return (darkest[0], darkest[1], None)
+
+
 def _orlosky_darkest_area(gray):
     """Coarse stage — return (x, y) of the centre of the darkest small region.
 
@@ -763,125 +926,693 @@ def _mask_outside_square(image, center, size):
 
 def _orlosky_contours(gray):
     """Run the Orlosky pipeline on an exclusion-masked grayscale image:
-    darkest-region search → relative threshold → ROI mask → dilate → contours.
+    Haar coarse seed → relative threshold → ROI mask → dilate → contours.
 
-    Returns (contours, darkest_point)."""
-    darkest = _orlosky_darkest_area(gray)
-    if darkest is None:
+    Returns (contours, seed_point)."""
+    seed = _orlosky_seed(gray)
+    if seed is None:
         return [], None
+    sx, sy, r = seed
 
     h, w = gray.shape[:2]
-    dval = int(gray[darkest[1], darkest[0]])
+    # threshold value from the darkest pixel in a small patch around the seed,
+    # not the global darkest pixel (which may sit in residual shadow)
+    win = int(r * _ORL_SEED_WIN_MULT) if r else _ORL_DARKEST_WIN
+    win = max(2, win)
+    x0 = max(0, sx - win); x1 = min(w, sx + win + 1)
+    y0 = max(0, sy - win); y1 = min(h, sy + win + 1)
+    patch = gray[y0:y1, x0:x1]
+    dval = int(patch.min()) if patch.size else int(gray[sy, sx])
     thresh = dval + _ORL_THRESHOLD_OFFSET
 
     # dark pupil → white
     _, binary = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY_INV)
-    # keep only a square ROI around the darkest point
-    binary = _mask_outside_square(binary, darkest,
-                                  int(_ORL_MASK_FRAC * min(h, w)))
+    # keep only a square ROI around the seed — sized from the seed radius when
+    # available, else the fixed fraction of the frame
+    roi_side = int(r * _ORL_ROI_R_MULT) if r else int(_ORL_MASK_FRAC * min(h, w))
+    binary = _mask_outside_square(binary, (sx, sy), roi_side)
     # dilate to close the pupil blob
     kernel = np.ones((_ORL_DILATE_KERNEL, _ORL_DILATE_KERNEL), np.uint8)
     binary = cv2.dilate(binary, kernel, iterations=_ORL_DILATE_ITERS)
 
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
-    return contours, darkest
+    return contours, seed
 
 
-def _inpaint_reflections(gray):
+def _inpaint_reflections(gray, mask=None):
     """Inpaint bright specular reflection artefacts (corneal LED reflexes).
 
     These near-saturated spots sit on top of the dark pupil and would punch
     bright holes through the threshold mask, breaking the pupil contour.
-    Returns the repaired grayscale image (unchanged if no reflections found).
+
+    If `mask` is given (the located corneal-reflex blob), only that region is
+    repaired — keeping the fix tight on the pupil and leaving the light-leak
+    glow untouched.  Otherwise every near-saturated pixel is inpainted.
+    Returns the repaired grayscale image (unchanged if nothing to repair).
     """
-    _, bright = cv2.threshold(gray, _INPAINT_BRIGHT_THRESH, 255,
-                              cv2.THRESH_BINARY)
-    if int(cv2.countNonZero(bright)) == 0:
+    if mask is None:
+        _, mask = cv2.threshold(gray, _INPAINT_BRIGHT_THRESH, 255,
+                                cv2.THRESH_BINARY)
+    if int(cv2.countNonZero(mask)) == 0:
         return gray
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                   (_INPAINT_DILATE, _INPAINT_DILATE))
-    bright = cv2.dilate(bright, k)          # cover the soft reflection halo
-    return cv2.inpaint(gray, bright, _INPAINT_RADIUS, cv2.INPAINT_TELEA)
+    mask = cv2.dilate(mask, k)              # cover the soft reflection halo
+    return cv2.inpaint(gray, mask, _INPAINT_RADIUS, cv2.INPAINT_TELEA)
 
 
-def detect_pupil(gray, live=False):
-    """Detect the pupil with the Orlosky method.
+def _annulus_mean(gray, cx, cy, r):
+    """Mean intensity of a ring just outside radius `r` around (cx, cy).
 
-    Returns a list of overlay dicts to draw — see _draw_overlays().
-    Normal mode: the single largest plausible pupil contour (green).
-    Debug mode (`SWIRSKI_DEBUG`): every contour found, unfiltered, each
-    labelled with its area and aspect ratio (yellow), plus the darkest point.
+    Used to test whether a bright blob sits in a dark surround (the pupil): the
+    corneal reflex does, the diffuse light-leak glow does not.
     """
+    h, w = gray.shape[:2]
+    r_in = int(r * 1.6) + 2
+    r_out = int(r * 3.2) + 4
+    x0 = max(0, cx - r_out); x1 = min(w, cx + r_out + 1)
+    y0 = max(0, cy - r_out); y1 = min(h, cy + r_out + 1)
+    win = gray[y0:y1, x0:x1]
+    if win.size == 0:
+        return 255.0
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    d2 = (xx - cx) ** 2 + (yy - cy) ** 2
+    ring = (d2 >= r_in * r_in) & (d2 <= r_out * r_out)
+    if not np.any(ring):
+        return 255.0
+    return float(win[ring].mean())
+
+
+def _find_corneal_reflex(gray):
+    """Locate the corneal reflex — the bright specular spot on/beside the pupil.
+
+    Thresholds the brightest pixels, then scores each compact blob by
+    (bbox fill) x (dark surround): the reflex is small, near-circular and ringed
+    by the dark pupil, which rejects the large diffuse light-leak glow and the
+    brighter-surrounded sclera/skin reflections.
+
+    Returns (cx, cy, equiv_r, blob_mask) for the best reflex, or None.
+    """
+    h, w = gray.shape[:2]
+    thr = max(_INPAINT_BRIGHT_THRESH,
+              float(np.percentile(gray, _REFLEX_BRIGHT_PCTILE)))
+    _, bright = cv2.threshold(gray, int(thr), 255, cv2.THRESH_BINARY)
+    if int(cv2.countNonZero(bright)) == 0:
+        return None
+
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(bright)
+    max_area = _REFLEX_MAX_AREA_FRAC * h * w
+
+    best = None
+    best_lbl = 0
+    best_score = -1.0
+    for lbl in range(1, n):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if area < _REFLEX_MIN_AREA or area > max_area:
+            continue
+        bw = int(stats[lbl, cv2.CC_STAT_WIDTH])
+        bh = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+        fill = area / float(bw * bh) if bw * bh > 0 else 0.0
+        if fill < _REFLEX_MIN_FILL:
+            continue
+        cx = int(round(centroids[lbl][0]))
+        cy = int(round(centroids[lbl][1]))
+        equiv_r = float(np.sqrt(area / np.pi))
+        dark_surround = 1.0 - _annulus_mean(gray, cx, cy, equiv_r) / 255.0
+        score = dark_surround * fill
+        if score > best_score:
+            best_score = score
+            best = (cx, cy, max(2, int(round(equiv_r))))
+            best_lbl = lbl
+
+    if best is None:
+        return None
+    blob_mask = np.where(labels == best_lbl, 255, 0).astype(np.uint8)
+    return best[0], best[1], best[2], blob_mask
+
+
+def _segment_pupil_at(gray, cx, cy, rmin, rmax):
+    """Build the pupil mask in an ROI centred on the (reflex) anchor.
+
+    Relative-thresholds the ROI at (local-darkest + offset), inverts so the dark
+    pupil becomes white, cleans it morphologically and keeps the connected
+    component under the anchor.  Deliberately does NOT reject border-touching or
+    low-solidity blobs: when the dark occluder patch merges with the pupil the
+    blob is irregular, and it is the gradient-aware RANSAC fit downstream that
+    recovers the true pupil ellipse from the visible iris-side arc.
+
+    Returns (mask, x0, y0) — mask in ROI coords, ROI top-left in `gray` — or None.
+    """
+    h, w = gray.shape[:2]
+    half = max(20, int(rmax * _PUPIL_ROI_R_MULT))
+    x0 = max(0, cx - half); x1 = min(w, cx + half)
+    y0 = max(0, cy - half); y1 = min(h, cy + half)
+    roi = gray[y0:y1, x0:x1]
+    if roi.size == 0 or min(roi.shape[:2]) < 10:
+        return None
+
+    roi_b = cv2.GaussianBlur(roi, (5, 5), 0)
+    lx, ly = cx - x0, cy - y0
+    win = max(4, int(rmin))
+    px0 = max(0, lx - win); px1 = min(roi.shape[1], lx + win + 1)
+    py0 = max(0, ly - win); py1 = min(roi.shape[0], ly + win + 1)
+    patch = roi_b[py0:py1, px0:px1]
+    dval = int(patch.min()) if patch.size else int(roi_b[ly, lx])
+    thresh = dval + _ORL_THRESHOLD_OFFSET
+
+    _, mask = cv2.threshold(roi_b, thresh, 255, cv2.THRESH_BINARY_INV)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    if n <= 1:
+        return None
+    lbl = 0
+    if 0 <= ly < mask.shape[0] and 0 <= lx < mask.shape[1]:
+        lbl = int(labels[ly, lx])
+    if lbl == 0:                              # anchor not on a blob — take largest
+        lbl = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    mask = np.where(labels == lbl, 255, 0).astype(np.uint8)
+    return mask, x0, y0
+
+
+def _swirski_support(ellipse, pts, gx, gy):
+    """Score a candidate ellipse by image-aware support.
+
+    A contour point supports the ellipse if it lies within _SW_INLIER_DIST of
+    the ellipse boundary AND its local image gradient points outward (dark
+    pupil -> light iris) — Swirski's image-aware support term.  Boundary points
+    on the dark occluder patch have no such outward gradient, so they do not
+    support the fit, which is what makes this occlusion-tolerant.
+
+    Returns (inlier_count, inlier_mask).
+    """
+    (ex, ey), (MA, ma), ang = ellipse
+    a, b = MA / 2.0, ma / 2.0
+    if a < 1.0 or b < 1.0:
+        return 0, None
+
+    th = np.deg2rad(ang)
+    cos_t, sin_t = np.cos(th), np.sin(th)
+
+    dx = pts[:, 0] - ex
+    dy = pts[:, 1] - ey
+    xr = cos_t * dx + sin_t * dy
+    yr = -sin_t * dx + cos_t * dy
+    t = np.sqrt((xr / a) ** 2 + (yr / b) ** 2)   # 1.0 on the boundary
+
+    mean_r = (a + b) / 2.0
+    near = np.abs(t - 1.0) < (_SW_INLIER_DIST / mean_r)
+
+    ix = np.clip(pts[:, 0].astype(int), 0, gx.shape[1] - 1)
+    iy = np.clip(pts[:, 1].astype(int), 0, gx.shape[0] - 1)
+    g_dot = gx[iy, ix] * dx + gy[iy, ix] * dy
+
+    inliers = near & (g_dot > 0)
+    return int(inliers.sum()), inliers
+
+
+def _swirski_fit_ellipse(mask, gray_roi, iters):
+    """RANSAC ellipse fit with image-aware support (Swirski stage 3).
+
+    Fits an ellipse to the pupil-mask boundary.  Each RANSAC hypothesis is built
+    from 5 random boundary points and scored by _swirski_support; the best
+    hypothesis is refined with a final fit to its inliers.
+
+    Returns an ellipse ((cx,cy),(MA,ma),angle) in ROI coordinates, or None.
+    """
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return None
+    pts = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+    if len(pts) < 5:
+        return None
+
+    gx = cv2.Sobel(gray_roi, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray_roi, cv2.CV_32F, 0, 1, ksize=3)
+
+    n = len(pts)
+    rng = np.random.default_rng(0)
+    best_score = 0
+    best_inliers = None
+    for _ in range(iters):
+        idx = rng.choice(n, 5, replace=False)
+        try:
+            ell = cv2.fitEllipse(pts[idx])
+        except cv2.error:
+            continue
+        score, inliers = _swirski_support(ell, pts, gx, gy)
+        if score > best_score:
+            best_score = score
+            best_inliers = inliers
+
+    if best_inliers is None or int(best_inliers.sum()) < 5:
+        try:
+            return cv2.fitEllipse(pts)
+        except cv2.error:
+            return None
+    try:
+        return cv2.fitEllipse(pts[best_inliers])
+    except cv2.error:
+        return None
+
+
+def _ray_ridges(gray, cx, cy, r_lo, r_hi, gx=None, gy=None):
+    """Cast _RAD_N_ANGLES rays from (cx, cy) over radii [r_lo, r_hi); return
+    (angles, radii).
+
+    radii[i] is the radius of the strongest OUTWARD intensity gradient (dark ->
+    bright) along ray i — a circular-boundary ridge — or np.nan if that ray has
+    no clear outward edge (e.g. a direction into the equally-dark occluder patch,
+    where the radial gradient stays near zero, so it drops out).  Using the
+    gradient ridge, not an intensity step, locks onto the true boundary and
+    ignores the slow violet-glow ramp.  Pass precomputed gx/gy to avoid recompute.
+    """
+    h, w = gray.shape[:2]
+    r_lo = max(3, int(r_lo))
+    r_hi = max(r_lo + 4, int(r_hi))
+    angles = np.linspace(0, 2 * np.pi, _RAD_N_ANGLES, endpoint=False)
+    radii = np.full(_RAD_N_ANGLES, np.nan, np.float32)
+    if gx is None or gy is None:
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=5)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=5)
+    rs = np.arange(r_lo, r_hi, dtype=np.float32)
+    if len(rs) < 3:
+        return angles, radii
+    for i, a in enumerate(angles):
+        ca, sa = np.cos(a), np.sin(a)
+        xs = np.clip((cx + rs * ca).astype(int), 0, w - 1)
+        ys = np.clip((cy + rs * sa).astype(int), 0, h - 1)
+        grad = gx[ys, xs] * ca + gy[ys, xs] * sa        # outward radial derivative
+        thr = _RAD_GRAD_K * (float(np.mean(np.abs(grad))) + 1e-6)
+        # Innermost clear outward ridge, not the global max: when both the
+        # pupil/iris and the (stronger) iris/sclera edges are on the ray, this
+        # keeps the radius on the pupil instead of overshooting to the iris.
+        inner = grad[1:-1]
+        cand = np.where((inner > thr) & (inner >= grad[:-2])
+                        & (inner > grad[2:]))[0] + 1     # local maxima above thr
+        if len(cand):
+            radii[i] = float(rs[cand[0]])
+    return angles, radii
+
+
+def _ray_edges(gray, cx, cy, rmin, rmax, r_start=0):
+    """Pupil-boundary ridges: _ray_ridges over the plausible-pupil radius band.
+
+    `r_start` skips the innermost radii (set it past the inpainted-reflex blob).
+    """
+    r_lo = max(3, int(rmin * 0.5), int(r_start))
+    r_hi = int(rmax * _RAD_SEARCH_MULT)
+    return _ray_ridges(gray, cx, cy, r_lo, r_hi)
+
+
+def _fit_concentric(P, Q):
+    """Joint least-squares fit of two CONCENTRIC circles to point sets P (pupil)
+    and Q (iris), sharing one centre.  Returns (cx, cy, rp, ri) or None.
+
+    The iris ring is larger and usually has a longer visible arc, so tying its
+    centre to the pupil's pins the common centre far more stably than the short
+    pupil arc alone — this is what keeps the centre right when the reflex sits on
+    the iris or the pupil's upper edge is lost in the dark socket.
+
+    Linear (Kasa) form with a shared centre (a, b): for every point
+    x^2+y^2 = 2a*x + 2b*y + c, where the constant c is per-ring
+    (c_p = rp^2-a^2-b^2 for pupil points, c_i for iris points); solve for
+    [a, b, c_p, c_i] in one least-squares system.
+    """
+    if len(P) < 3 or len(Q) < 3:
+        return None
+    rows = []
+    rhs = []
+    for (x, y) in P:
+        rows.append([2 * x, 2 * y, 1.0, 0.0]); rhs.append(x * x + y * y)
+    for (x, y) in Q:
+        rows.append([2 * x, 2 * y, 0.0, 1.0]); rhs.append(x * x + y * y)
+    A = np.array(rows, np.float64)
+    b = np.array(rhs, np.float64)
+    try:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    a, bb, cp, ci = sol
+    rp2 = cp + a * a + bb * bb
+    ri2 = ci + a * a + bb * bb
+    if rp2 <= 0 or ri2 <= 0:
+        return None
+    return float(a), float(bb), float(np.sqrt(rp2)), float(np.sqrt(ri2))
+
+
+def _points_from_radii(cx, cy, angles, radii):
+    """Convert (angles, radii) edge hits into an (N, 2) float32 point array."""
+    m = ~np.isnan(radii)
+    if not np.any(m):
+        return np.empty((0, 2), np.float32)
+    xs = cx + radii[m] * np.cos(angles[m])
+    ys = cy + radii[m] * np.sin(angles[m])
+    return np.stack([xs, ys], axis=1).astype(np.float32)
+
+
+def _refine_center(gray, cx, cy, rmin, rmax, iters):
+    """Recenter onto the pupil using opposing ray pairs (robust to occlusion).
+
+    For each axis where BOTH opposite rays hit a pupil edge, the midpoint along
+    that axis estimates the centre; the median offset over all two-sided axes is
+    the recentre step.  One-sided axes (the occluded patch side, or the bright
+    glow running off one way) are skipped, so the estimate cannot run away the
+    way a full ellipse-fit recentre does.  Returns the refined (cx, cy).
+    """
+    half = _RAD_N_ANGLES // 2
+    for _ in range(iters):
+        angles, radii = _ray_edges(gray, cx, cy, rmin, rmax)
+        offs = []
+        for k in range(half):
+            rp, rn = radii[k], radii[k + half]
+            if not np.isnan(rp) and not np.isnan(rn):
+                shift = (rp - rn) / 2.0          # along +angles[k]
+                offs.append((shift * np.cos(angles[k]),
+                             shift * np.sin(angles[k])))
+        if not offs:
+            break
+        ox = float(np.median([o[0] for o in offs]))
+        oy = float(np.median([o[1] for o in offs]))
+        if abs(ox) < 1.5 and abs(oy) < 1.5:
+            break
+        cx = int(round(cx + ox))
+        cy = int(round(cy + oy))
+    return cx, cy
+
+
+def _fit_ellipse_robust(pts):
+    """Least-squares ellipse fit to boundary points, with one outlier-rejecting
+    refit (drop points more than _RAD_INLIER_PX from the first fit).  Returns
+    ((cx,cy),(MA,ma),angle) or None."""
+    if len(pts) < 5:
+        return None
+    try:
+        ell = cv2.fitEllipse(pts.reshape(-1, 1, 2))
+    except cv2.error:
+        return None
+
+    (ex, ey), (MA, ma), ang = ell
+    a, b = MA / 2.0, ma / 2.0
+    if a < 1.0 or b < 1.0:
+        return ell
+    th = np.deg2rad(ang)
+    cos_t, sin_t = np.cos(th), np.sin(th)
+    dx = pts[:, 0] - ex
+    dy = pts[:, 1] - ey
+    xr = cos_t * dx + sin_t * dy
+    yr = -sin_t * dx + cos_t * dy
+    t = np.sqrt((xr / a) ** 2 + (yr / b) ** 2)
+    mean_r = (a + b) / 2.0
+    inl = np.abs(t - 1.0) * mean_r < _RAD_INLIER_PX
+    if int(inl.sum()) >= 5:
+        try:
+            return cv2.fitEllipse(pts[inl].reshape(-1, 1, 2))
+        except cv2.error:
+            return ell
+    return ell
+
+
+def _fit_circle(pts):
+    """Algebraic (Kasa) least-squares circle fit.  Returns (cx, cy, r) or None.
+
+    A circle (3 DOF) — not an ellipse (5 DOF) — because the pupil's upper edge
+    merges into the equally-dark socket, so usually only a partial boundary arc
+    is visible; an ellipse fit to a <180-degree arc is ill-posed and explodes,
+    whereas a circle is recovered stably (pupils are near-circular here anyway).
+    """
+    if len(pts) < 3:
+        return None
+    x = pts[:, 0]
+    y = pts[:, 1]
+    A = np.stack([2 * x, 2 * y, np.ones(len(x))], axis=1)
+    b = x * x + y * y
+    try:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    a, bb, c = sol
+    r2 = c + a * a + bb * bb
+    if r2 <= 0:
+        return None
+    return float(a), float(bb), float(np.sqrt(r2))
+
+
+def _fit_circle_robust(pts):
+    """Circle fit with one median-radius outlier-rejection refit (drops stray
+    eyelid-crease edge points).  Returns (cx, cy, r) or None."""
+    fit = _fit_circle(pts)
+    if fit is None:
+        return None
+    a, b, r = fit
+    d = np.hypot(pts[:, 0] - a, pts[:, 1] - b)
+    inl = np.abs(d - np.median(d)) < _RAD_INLIER_PX * 2.0
+    if int(inl.sum()) >= 3 and int(inl.sum()) < len(pts):
+        f2 = _fit_circle(pts[inl])
+        if f2 is not None:
+            return f2
+    return fit
+
+
+def detect_redeye(flash_bgr, ax, ay, rmin, rmax):
+    """Detect the pupil from the flash image's red-eye retroreflection.
+
+    When the illumination, pupil and camera are well aligned the flash returns a
+    bright warm (reddish) glow straight back through the pupil — a strong
+    *positive* pupil cue that survives when the ambient dark-disc is occluded.
+    The search is constrained to a window around the ambient reflex anchor
+    (`ax, ay`) so stray warm skin/sclera reflections elsewhere are ignored.
+
+    Returns (cx, cy, r, conf) for the glow, or None.  `conf` is the glow peak on
+    a red-weighted, blurred map (flash is otherwise near-black, so a true
+    retroreflection stands out); callers gate on it.  Fires only when the glow is
+    bright, pupil-scale and genuinely warm (R > B) — otherwise returns None.
+    """
+    if flash_bgr is None or flash_bgr.ndim != 3:
+        return None
+    h, w = flash_bgr.shape[:2]
+    win = int(rmax * _REDEYE_WIN_MULT)
+    x0 = max(0, ax - win); x1 = min(w, ax + win)
+    y0 = max(0, ay - win); y1 = min(h, ay + win)
+    roi = flash_bgr[y0:y1, x0:x1].astype(np.float32)
+    if roi.size == 0:
+        return None
+    b, g, r = cv2.split(roi)
+    glow = cv2.GaussianBlur(np.clip(r - _REDEYE_BLUE_SUB * b, 0, 255), (15, 15), 0)
+    peak = float(glow.max())
+    if peak < _REDEYE_MIN_PEAK:
+        return None
+    _, _, _, mxloc = cv2.minMaxLoc(glow)
+    gx, gy = mxloc[0] + x0, mxloc[1] + y0
+
+    # blob at >60% of peak -> radius; reject pin-point speculars and huge spills
+    _, mask = cv2.threshold(np.uint8(255 * glow / (peak + 1e-6)),
+                            int(255 * 0.6), 255, cv2.THRESH_BINARY)
+    area = int(cv2.countNonZero(mask))
+    rr = float(np.sqrt(area / np.pi))
+    if rr < rmin * 0.5 or rr > rmax * 1.6:
+        return None
+    # must be genuinely warm at the peak (retinal reflex), not a white specular
+    if float(r[mxloc[1], mxloc[0]]) <= float(b[mxloc[1], mxloc[0]]):
+        return None
+    return gx, gy, rr, peak
+
+
+def detect_pupil(img, live=False):
+    """Detect the pupil: reflex anchor -> green-channel pupil blob -> radial fit.
+
+    `img` is the colour (BGR) ambient image, or a grayscale image.  Returns a
+    list of overlay dicts to draw — see _draw_overlays().
+
+    Pipeline: the bright corneal reflex anchors which dark region is the pupil;
+    the pupil blob is segmented on the GREEN channel (cleanest dark-pupil /
+    bright-iris contrast under the violet light) and its centroid recenters the
+    search (the reflex sits at the pupil *edge*, not its centre); radial rays
+    from that centre give boundary points whose ellipse is robustly fit.  Rays
+    into the dark occluder patch never brighten, so they drop out and a partially
+    occluded boundary is tolerated.
+
+    Normal mode: the single best plausible pupil ellipse (green).
+    Debug mode (`SWIRSKI_DEBUG`): the fitted ellipse (yellow/red) plus the anchor
+    and recentred centre.  Set PUPIL_DEBUG_STAGES to a list to also collect
+    per-stage images.
+    """
+    global _LAST_ANCHOR, _LAST_PUPIL, _LAST_CONF
+    _LAST_ANCHOR = None
+    _LAST_PUPIL = None
+    _LAST_CONF = 0.0
     if not CV2_AVAILABLE:
         return []
-    if gray.ndim != 2:
-        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+    if img.ndim == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        green = img[:, :, 1]                 # BGR -> green channel
+    else:
+        gray = img
+        green = img
+    _dbg("1_green", green)
 
-    # Inpaint bright specular reflections before any Orlosky processing
-    gray = _inpaint_reflections(gray)
-
-    # Blank the flash-LED cover so the darkest-area search ignores it
-    gray = _apply_exclusions(gray)
     h, w = gray.shape[:2]
-    min_area = _ORL_MIN_AREA_FRAC * h * w
+    rmin = _SW_MIN_R_FRAC * min(h, w)
+    rmax = _SW_MAX_R_FRAC * min(h, w)
 
-    contours, darkest = _orlosky_contours(gray)
+    # ── Stage 1: locate the corneal reflex (anchor) ───────────────────────
+    reflex = _find_corneal_reflex(gray)
+    if reflex is not None:
+        _LAST_ANCHOR = (reflex[0], reflex[1])
+    if PUPIL_DEBUG_STAGES is not None:
+        vis = cv2.cvtColor(green, cv2.COLOR_GRAY2BGR)
+        if reflex is not None:
+            cv2.circle(vis, (reflex[0], reflex[1]), max(6, reflex[2] * 2),
+                       (0, 0, 255), 2)
+        _dbg("2_reflex", vis)
+
+    # ── Stage 2: inpaint the reflex on the green channel, then blur ────────
+    reflex_mask = reflex[3] if reflex is not None else None
+    work = _inpaint_reflections(green, reflex_mask)
+    work = cv2.GaussianBlur(work, (7, 7), 0)
+    _dbg("3_green_prepped", work)
+
+    # ── Stage 3: seed centre — reflex anchor, else Haar coarse fallback ────
+    if reflex is not None:
+        ax, ay = reflex[0], reflex[1]
+    else:
+        coarse = _swirski_coarse(work, rmin, rmax)
+        if coarse is None:
+            if not live:
+                print("No pupil detected (no reflex, no coarse seed).")
+            return []
+        ax, ay = coarse[0], coarse[1]
+
+    # The reflex sits at the pupil *edge*, not its centre.  Iterate a robust
+    # CIRCLE fit: cast rays from the current centre, fit a circle to the visible
+    # arc, move the centre to the fit centre, re-cast.  A circle fit is stable on
+    # a partial arc (unlike an ellipse fit), so this converges instead of running
+    # away into the bright glow the way the ellipse recentre did.
+    # start rays just beyond the reflex blob so its inpaint boundary is not read
+    # as the pupil edge (which collapsed the fit to a tiny reflex-sized circle)
+    r_start = int(reflex[2] * 1.7) if reflex is not None else 0
+    cx, cy = ax, ay
+    pts = np.empty((0, 2), np.float32)
+    fit = None
+    trail = [(cx, cy)]
+    for _ in range(_RAD_RECENTRE_ITERS):
+        angles, radii = _ray_edges(work, cx, cy, rmin, rmax, r_start)
+        p = _points_from_radii(cx, cy, angles, radii)
+        if len(p) < 5:
+            break
+        pts = p
+        f = _fit_circle_robust(p)
+        if f is None:
+            break
+        fit = f
+        ncx, ncy = int(round(f[0])), int(round(f[1]))
+        trail.append((ncx, ncy))
+        moved = abs(ncx - cx) > 2 or abs(ncy - cy) > 2
+        cx, cy = ncx, ncy
+        if not moved:
+            break
+
+    if PUPIL_DEBUG_STAGES is not None:
+        edgevis = cv2.cvtColor(work, cv2.COLOR_GRAY2BGR)
+        for px, py in pts:
+            cv2.circle(edgevis, (int(px), int(py)), 3, (0, 255, 255), -1)
+        for i in range(1, len(trail)):
+            cv2.line(edgevis, trail[i - 1], trail[i], (255, 255, 0), 1)
+        cv2.circle(edgevis, (ax, ay), 5, (255, 0, 255), -1)    # anchor
+        cv2.circle(edgevis, (cx, cy), 5, (0, 255, 0), -1)      # refined centre
+        _dbg("4_recentre_edges", edgevis)
+
+    if fit is None or len(pts) < 5:
+        if not live:
+            print(f"No pupil detected ({len(pts)} edge point(s), fit={fit}).")
+        return []
+
+    fcx, fcy, r = fit
+
+    # ── Stage 5: concentric iris refinement ───────────────────────────────
+    # The pupil and iris are concentric.  Detect the iris/limbus ridge in the
+    # annulus beyond the pupil and jointly fit both rings about a shared centre;
+    # the larger iris arc pins the centre far more stably than the short pupil
+    # arc, which corrects the centre when the reflex sat on the iris or the
+    # pupil's upper edge was lost.  Adopted only if the iris ring is well covered.
+    iris = None
+    ia, ir = _ray_ridges(work, int(fcx), int(fcy),
+                         int(r * _IRIS_RP_MIN), int(r * _IRIS_SEARCH_MAX))
+    iris_pts = _points_from_radii(fcx, fcy, ia, ir)
+    iris_cover = len(iris_pts) / float(_RAD_N_ANGLES)
+    if iris_cover >= _IRIS_MIN_COVER and len(pts) >= 5:
+        con = _fit_concentric(pts, iris_pts)
+        if con is not None:
+            ncx, ncy, nrp, nri = con
+            ratio = nri / nrp if nrp > 0 else 0.0
+            moved = np.hypot(ncx - fcx, ncy - fcy)
+            # Only trust the iris ring if the points actually lie ON a circle
+            # (tight radial spread).  In these tight macro frames the limbus is
+            # not a clean circle, so the "iris" ridges are scattered eyelid/glow
+            # noise -> high residual -> rejected, and the pupil-only fit stands.
+            d = np.hypot(iris_pts[:, 0] - ncx, iris_pts[:, 1] - ncy)
+            iris_rms = float(np.std(d - nri)) if len(d) else 1e9
+            if (_IRIS_RP_MIN <= ratio <= _IRIS_RP_MAX
+                    and nrp >= rmin * 0.6 and moved < r
+                    and iris_rms < _IRIS_MAX_RMS_FRAC * nri):
+                fcx, fcy, r = ncx, ncy, nrp
+                iris = (ncx, ncy, nri)
+    if PUPIL_DEBUG_STAGES is not None:
+        irisvis = cv2.cvtColor(work, cv2.COLOR_GRAY2BGR)
+        for px, py in iris_pts:
+            cv2.circle(irisvis, (int(px), int(py)), 3, (0, 165, 255), -1)
+        if iris is not None:
+            cv2.circle(irisvis, (int(iris[0]), int(iris[1])), int(iris[2]),
+                       (0, 165, 255), 1)
+        cv2.circle(irisvis, (int(fcx), int(fcy)), int(r), (0, 255, 0), 1)
+        cv2.circle(irisvis, (int(fcx), int(fcy)), 4, (0, 255, 0), -1)
+        _dbg(f"5_iris_concentric cov={iris_cover:.2f}", irisvis)
+
+    # ── Stage 6: validate the fitted circle ───────────────────────────────
+    angular_cover = len(pts) / float(_RAD_N_ANGLES)   # fraction of rays with an edge
+    too_big = r > rmax * 1.5
+    too_small = r < rmin * 0.6
+    too_partial = angular_cover < _RAD_MIN_COVER
+    bad = too_big or too_small or too_partial
+    ell_full = ((float(fcx), float(fcy)), (float(2 * r), float(2 * r)), 0.0)
+
+    # Stash for ambient/flash fusion: confidence = coverage x inlier tightness.
+    d = np.hypot(pts[:, 0] - fcx, pts[:, 1] - fcy)
+    inlier_frac = float(np.mean(np.abs(d - r) < 0.18 * r)) if len(pts) else 0.0
+    _LAST_CONF = 0.0 if bad else angular_cover * inlier_frac
+    _LAST_PUPIL = None if bad else (float(fcx), float(fcy), float(r))
 
     if not SWIRSKI_DEBUG:
-        best = None
-        best_area = 0.0
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < min_area or len(c) < 5:
-                continue
-            _x, _y, bw, bh = cv2.boundingRect(c)
-            if min(bw, bh) == 0:
-                continue
-            if max(bw / bh, bh / bw) > _ORL_MAX_RATIO:
-                continue
-            if area > best_area:
-                best_area = area
-                best = c
-        if best is None:
+        if bad:
+            if not live:
+                print("No pupil detected (implausible circle).")
             return []
-        try:
-            ell = cv2.fitEllipse(best)
-        except cv2.error:
-            return []
-        (ex, ey), _, _ = ell
         if not live:
-            print(f"Pupil detected at ({int(ex)}, {int(ey)}).")
-        return [{"ellipse": ell, "label": "", "color": (0, 255, 0)}]
+            print(f"Pupil detected at ({int(fcx)}, {int(fcy)}), r={r:.0f}.")
+        overlays = [{"ellipse": ell_full, "label": "", "color": (0, 255, 0)}]
+    else:
+        col = (0, 0, 255) if bad else (0, 255, 255)
+        if not live:
+            print(f"[debug] circle r={r:.0f} cover={angular_cover:.2f} from "
+                  f"{len(pts)} pts at ({int(fcx)}, {int(fcy)})"
+                  + ("  REJECTED" if bad else ""))
+        overlays = [{
+            "ellipse": ell_full,
+            "label": f"r={r:.0f} cov={angular_cover:.2f}",
+            "color": col,
+        }, {
+            "ellipse": ((float(ax), float(ay)), (16.0, 16.0), 0.0),
+            "label": "anchor",
+            "color": (255, 0, 255),
+        }]
 
-    # ── debug: annotate every contour, discard nothing ────────────────────
-    overlays = []
-    n = 0
-    for c in contours:
-        if len(c) < 5:                       # cv2.fitEllipse needs >= 5 points
-            continue
-        try:
-            ell = cv2.fitEllipse(c)
-        except cv2.error:
-            continue
-        n += 1
-        area = cv2.contourArea(c)
-        _x, _y, bw, bh = cv2.boundingRect(c)
-        ratio = max(bw / bh, bh / bw) if min(bw, bh) > 0 else 0.0
-        overlays.append({
-            "ellipse": ell,
-            "label": f"{n} a={int(area)} ar={ratio:.1f}",
-            "color": (0, 255, 255),          # yellow — candidate contour
-        })
-    if not live:
-        print(f"[debug] {n} pupil candidate(s) (Orlosky).")
-    if darkest is not None:
-        overlays.append({
-            "ellipse": ((float(darkest[0]), float(darkest[1])),
-                        (16.0, 16.0), 0.0),
-            "label": "darkest",
-            "color": (255, 0, 255),          # magenta — darkest point
-        })
+    if PUPIL_DEBUG_STAGES is not None:
+        finalvis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        _draw_overlays(finalvis, overlays)
+        _dbg("9_final", finalvis)
     return overlays
 
 
@@ -932,22 +1663,94 @@ def process_image(array, overlays=None):
     return img
 
 
+def _fuse_pupil(amb_pupil, amb_conf, redeye):
+    """Fuse the ambient dark-disc fit and the flash red-eye into one decision.
+
+    Both are in the same (rotated/display) orientation.  Strategy, given that
+    the two cues are complementary (the red-eye is strong only when well aligned,
+    the ambient dark-disc only when the pupil is unoccluded):
+
+    - A strongly-trusted red-eye that *disagrees* with the ambient fit (or when
+      there is no ambient fit) wins — this is the occluded case (e.g. 145755)
+      where the ambient drifts onto the occluder boundary but the retroreflection
+      sits squarely on the pupil.
+    - Otherwise the ambient circle stands (it gives a proper boundary radius); a
+      red-eye that *agrees* just corroborates it.
+    - If neither is usable, returns None so the caller can flag the frame.
+
+    Returns (cx, cy, r, source, confident) or None.
+    """
+    strong_redeye = redeye is not None and redeye[3] >= _REDEYE_TRUST
+    if strong_redeye:
+        rx, ry, rr, _ = redeye
+        if amb_pupil is not None:
+            ax, ay, ar = amb_pupil
+            if np.hypot(rx - ax, ry - ay) <= ar:          # agree -> keep ambient
+                return ax, ay, ar, "ambient+redeye", True
+        return float(rx), float(ry), float(rr), "redeye", True   # override / sole
+    if amb_pupil is not None:
+        ax, ay, ar = amb_pupil
+        return ax, ay, ar, "ambient", amb_conf >= _AMBIENT_MIN_CONF
+    if redeye is not None:                                 # weak red-eye, last resort
+        rx, ry, rr, _ = redeye
+        return float(rx), float(ry), float(rr), "redeye?", False
+    return None
+
+
 def detect_and_annotate(ambient_array, flash_array):
-    """Detect the pupil in the ambient image and annotate the flash image.
+    """Detect the pupil and annotate the flash image, fusing two cues.
 
     Detection runs in the display (rotated) orientation so its result lines up
-    with the rotated flash photo that process_image() produces.  Returns
+    with the rotated flash photo that process_image() produces.  The ambient
+    dark-disc fit (detect_pupil) and the flash red-eye retroreflection
+    (detect_redeye) are fused by _fuse_pupil().  Returns
     (annotated_PIL_image, overlays).  Shared by capture_image() and the offline
-    test harness (test_pupil_detection.py) so detection is identical in both.
+    test harness so detection is identical in both.
     """
     overlays = []
     if CV2_AVAILABLE:
-        amb_bgr = cv2.cvtColor(ambient_array, cv2.COLOR_RGB2BGR)
         rot = _CV2_ROTATIONS[LIVE_ROTATION]
+        amb_bgr = cv2.cvtColor(ambient_array, cv2.COLOR_RGB2BGR)
+        flash_bgr = cv2.cvtColor(flash_array, cv2.COLOR_RGB2BGR)
         if rot is not None:
             amb_bgr = cv2.rotate(amb_bgr, rot)
-        gray = cv2.cvtColor(amb_bgr, cv2.COLOR_BGR2GRAY)
-        overlays = detect_pupil(gray)
+            flash_bgr = cv2.rotate(flash_bgr, rot)
+
+        # Ambient dark-disc fit (uses the green channel — robust to skin/eye
+        # colour because under violet light green suppresses the skin glow).
+        detect_pupil(amb_bgr)
+        amb_pupil, amb_conf, anchor = _LAST_PUPIL, _LAST_CONF, _LAST_ANCHOR
+
+        # Flash red-eye, searched around the ambient reflex anchor.
+        redeye = None
+        if anchor is not None:
+            h, w = amb_bgr.shape[:2]
+            rmin = _SW_MIN_R_FRAC * min(h, w)
+            rmax = _SW_MAX_R_FRAC * min(h, w)
+            redeye = detect_redeye(flash_bgr, anchor[0], anchor[1], rmin, rmax)
+        if PUPIL_DEBUG_STAGES is not None:
+            rv = cv2.convertScaleAbs(flash_bgr, alpha=3.0)   # brighten the dark flash
+            if anchor is not None:
+                cv2.circle(rv, (anchor[0], anchor[1]), 5, (255, 0, 255), -1)
+            if redeye is not None:
+                cv2.circle(rv, (int(redeye[0]), int(redeye[1])),
+                           max(6, int(redeye[2])), (0, 255, 255), 2)
+            tag = f"peak={redeye[3]:.0f}" if redeye is not None else "none"
+            _dbg(f"7_flash_redeye {tag}", rv)
+
+        fused = _fuse_pupil(amb_pupil, amb_conf, redeye)
+        if fused is not None:
+            cx, cy, r, source, confident = fused
+            ell = ((cx, cy), (2 * r, 2 * r), 0.0)
+            colour = (0, 255, 0) if confident else (0, 165, 255)   # amber = low-conf
+            label = source if SWIRSKI_DEBUG else ""
+            if not confident:
+                label = (label + " low-conf").strip()
+            overlays = [{"ellipse": ell, "label": label, "color": colour}]
+        if PUPIL_DEBUG_STAGES is not None:
+            fv = cv2.convertScaleAbs(flash_bgr, alpha=3.0)
+            _draw_overlays(fv, overlays)
+            _dbg(f"8_fused {fused[3] if fused else 'NONE'}", fv)
     img = process_image(flash_array, overlays)
     return img, overlays
 

@@ -48,6 +48,13 @@ import cap
 HERE = os.path.dirname(os.path.abspath(__file__))
 TRANSFERS_DIR = os.path.join(HERE, "Transfers")
 
+# Per-stage debug output of the detection pipeline.  Toggle here (or via the
+# DEBUG_MODE env var):
+#   "off"      no stage output, just annotated.jpg
+#   "stages"   one stage_N_<name>.jpg per pipeline stage in each capture folder
+#   "montage"  a single labelled grid, debug_montage.jpg, per capture folder
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "montage")
+
 
 def load_capture(folder):
     """Load (ambient_array, flash_array, meta) from a capture folder.
@@ -78,6 +85,53 @@ def load_capture(folder):
     return ambient, flash, meta
 
 
+def _label_bar(img, text):
+    """Return `img` (a BGR uint8 array) with a black caption bar + `text` on top."""
+    h, w = img.shape[:2]
+    bar = np.zeros((22, w, 3), dtype=np.uint8)
+    cap.cv2.putText(bar, text, (4, 16), cap.cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (255, 255, 255), 1, cap.cv2.LINE_AA)
+    return np.vstack([bar, img])
+
+
+def save_debug_stages(folder, stages, mode):
+    """Write the collected per-stage debug images for one capture folder.
+
+    `stages` is the list cap.detect_pupil() filled — (name, BGR_image) tuples.
+    `mode` is "stages" (one stage_N_<name>.jpg each) or "montage" (one grid).
+    """
+    if not stages or mode not in ("stages", "montage"):
+        return
+    cv2 = cap.cv2
+
+    if mode == "stages":
+        for i, (name, img) in enumerate(stages, 1):
+            path = os.path.join(folder, f"stage_{i}_{name}.jpg")
+            cv2.imwrite(path, img)
+        return
+
+    # montage — scale every stage to a common width, caption, stack in a grid
+    cell_w = 360
+    cells = []
+    for name, img in stages:
+        h, w = img.shape[:2]
+        scaled = cv2.resize(img, (cell_w, max(1, int(h * cell_w / w))))
+        cells.append(_label_bar(scaled, name))
+    row_h = max(c.shape[0] for c in cells)
+    cells = [cv2.copyMakeBorder(c, 0, row_h - c.shape[0], 0, 0,
+                                cv2.BORDER_CONSTANT, value=(0, 0, 0))
+             for c in cells]
+    cols = 3
+    rows = []
+    for r in range(0, len(cells), cols):
+        row = cells[r:r + cols]
+        while len(row) < cols:                       # pad short final row
+            row.append(np.zeros_like(cells[0]))
+        rows.append(np.hstack(row))
+    montage = np.vstack(rows)
+    cv2.imwrite(os.path.join(folder, "debug_montage.jpg"), montage)
+
+
 def run_one(folder):
     """Run detection on a single capture folder and write annotated.jpg.
 
@@ -95,7 +149,14 @@ def run_one(folder):
     if "live_rotation" in meta:
         cap.LIVE_ROTATION = int(meta["live_rotation"])
 
+    # Arm the per-stage debug sink so detect_pupil() records intermediates.
+    if DEBUG_MODE in ("stages", "montage"):
+        cap.PUPIL_DEBUG_STAGES = []
+
     img, overlays = cap.detect_and_annotate(ambient, flash)
+
+    save_debug_stages(folder, cap.PUPIL_DEBUG_STAGES or [], DEBUG_MODE)
+    cap.PUPIL_DEBUG_STAGES = None
 
     out_path = os.path.join(folder, "annotated.jpg")
     img.save(out_path)
