@@ -17,8 +17,11 @@ PROTOCOL
 POST /upload/<folder>/<filename>
     body: raw file bytes (Content-Length must be set)
 
-<folder>   = capture_YYYYMMDD_HHMMSS
-<filename> = ambient.jpg | flash.jpg | meta.json
+<folder>   = capture_YYYYMMDD_HHMMSS   -> written under Transfers/<folder>/
+           | calibration              -> written under calibration/; an uploaded
+                                          led_cover_calib.jpg triggers building the
+                                          cover mask HERE (cap.build_cover_mask)
+<filename> = ambient.jpg | flash.jpg | both.jpg | meta.json | led_cover_calib.jpg
 
 Anything else returns 400.  No auth — only listen on a trusted local network
 (e.g. this machine's Windows mobile hotspot, where the Pi is the only client).
@@ -35,6 +38,34 @@ PORT = 8000
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TRANSFERS_DIR = os.path.join(HERE, "Transfers")
+# The Pi uploads its LED-cover calibration under the special `calibration`
+# folder; route it to calibration/ (next to cap.py, where cap.load_cover_mask
+# reads it) instead of Transfers/, so one Pi calibration covers this machine too.
+CALIBRATION_FOLDER = "calibration"
+CALIBRATION_DIR = os.path.join(HERE, "calibration")
+CALIB_IMAGE_NAME = "led_cover_calib.jpg"   # the raw calibration frame the Pi ships
+
+
+def _build_cover_mask_from(image_path):
+    """Build + save the LED-cover mask from an uploaded calibration image.
+
+    Reuses cap.build_cover_mask (near-black + edge-touching + smoothing/fill) and
+    save_cover_calibration, so the mask lands at cap.COVER_CALIB_MASK_PATH where
+    cap.load_cover_mask reads it.  Fully guarded — the receiver must stay up even
+    if cv2/cap are unavailable or the build fails.
+    """
+    try:
+        import cap
+        bgr = cap.cv2.imread(image_path)
+        mask = cap.build_cover_mask(bgr)
+        if mask is not None and cap.save_cover_calibration(mask):
+            frac = 100.0 * float((mask > 0).sum()) / mask.size
+            print(f"  built cover mask ({frac:.1f}% of frame) -> "
+                  f"{cap.COVER_CALIB_MASK_PATH}")
+        else:
+            print("  cover-mask build failed (no dark edge-touching region?)")
+    except Exception as e:                       # noqa: BLE001 — never crash receiver
+        print(f"  cover-mask build error: {e}")
 
 # Only safe path segments — no slashes, no "..", no exotic characters.
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -74,7 +105,12 @@ class UploadHandler(BaseHTTPRequestHandler):
             self._reply(500, f"read failed: {e}")
             return
 
-        dest_dir = os.path.join(TRANSFERS_DIR, folder)
+        # `calibration` is special — it lands in calibration/ (where cap.py loads
+        # the cover mask), not under Transfers/.
+        if folder == CALIBRATION_FOLDER:
+            dest_dir = CALIBRATION_DIR
+        else:
+            dest_dir = os.path.join(TRANSFERS_DIR, folder)
         dest = os.path.join(dest_dir, filename)
         try:
             os.makedirs(dest_dir, exist_ok=True)
@@ -87,6 +123,12 @@ class UploadHandler(BaseHTTPRequestHandler):
         kb = len(data) / 1024.0
         size = f"{kb:.1f} KB" if kb < 1024 else f"{kb / 1024:.2f} MB"
         print(f"received {folder}/{filename} ({size})")
+
+        # Build the LED-cover mask HERE (on this machine) from an uploaded
+        # calibration image — the Pi only ships the image.  Guarded so a missing
+        # cv2 / build failure never takes the receiver down.
+        if folder == CALIBRATION_FOLDER and filename == CALIB_IMAGE_NAME:
+            _build_cover_mask_from(dest)
         self._reply(200, "ok")
 
     def _reply(self, status, msg):

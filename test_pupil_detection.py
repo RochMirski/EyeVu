@@ -73,6 +73,14 @@ def load_capture(folder):
     ambient = np.array(Image.open(ambient_path).convert("RGB"))
     flash = np.array(Image.open(flash_path).convert("RGB"))
 
+    # Optional flash+ambient combined frame (new 3-frame capture).  When present
+    # it is the input the iris-band concentric detector will use; for now we load
+    # it so a channel/gradient diagnostic can be written for it.
+    both = None
+    both_path = os.path.join(folder, "both.jpg")
+    if os.path.isfile(both_path):
+        both = np.array(Image.open(both_path).convert("RGB"))
+
     meta = {}
     meta_path = os.path.join(folder, "meta.json")
     if os.path.isfile(meta_path):
@@ -82,7 +90,7 @@ def load_capture(folder):
         except (OSError, ValueError) as e:
             print(f"  WARN — could not read meta.json: {e}")
 
-    return ambient, flash, meta
+    return ambient, flash, meta, both
 
 
 def _label_bar(img, text):
@@ -92,6 +100,38 @@ def _label_bar(img, text):
     cap.cv2.putText(bar, text, (4, 16), cap.cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (255, 255, 255), 1, cap.cv2.LINE_AA)
     return np.vstack([bar, img])
+
+
+def save_both_diagnostic(folder, both_rgb, live_rotation):
+    """Write a channel/gradient diagnostic for the flash+ambient combined frame.
+
+    On `both.jpg` the pupil retroreflects bright (best in RED) while the iris /
+    limbus is ambient-lit structure (best in GREEN), and the two boundaries differ
+    by gradient sign.  This panel (Red | Green | Sobel-magnitude) is what the
+    iris-band detector will be designed against — written only when a combined
+    frame exists, so it is dormant until the new capture mode produces data.
+    """
+    cv2 = cap.cv2
+    bgr = cv2.cvtColor(both_rgb, cv2.COLOR_RGB2BGR)
+    rot = cap._CV2_ROTATIONS[live_rotation]
+    if rot is not None:
+        bgr = cv2.rotate(bgr, rot)
+    b, g, r = cv2.split(bgr)
+    gb = cv2.GaussianBlur(g, (7, 7), 0)
+    mag = cv2.magnitude(cv2.Sobel(gb, cv2.CV_32F, 1, 0, ksize=5),
+                        cv2.Sobel(gb, cv2.CV_32F, 0, 1, ksize=5))
+    mag = np.uint8(255 * mag / (mag.max() + 1e-6))
+
+    def lab(im, t):
+        im = cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
+        cv2.putText(im, t, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 255, 255), 2)
+        return im
+
+    row = np.hstack([lab(r, "Red (bright pupil)"),
+                     lab(g, "Green (iris/limbus)"),
+                     lab(mag, "grad mag")])
+    cv2.imwrite(os.path.join(folder, "both_diag.jpg"), row)
 
 
 def save_debug_stages(folder, stages, mode):
@@ -142,12 +182,17 @@ def run_one(folder):
     loaded = load_capture(folder)
     if loaded is None:
         return -1
-    ambient, flash, meta = loaded
+    ambient, flash, meta, both = loaded
 
     # Rotate exactly as the Pi did at capture time.  detect_and_annotate() and
     # process_image() read cap.LIVE_ROTATION as a module global, so set it here.
     if "live_rotation" in meta:
         cap.LIVE_ROTATION = int(meta["live_rotation"])
+
+    # Combined flash+ambient frame: write its channel/gradient diagnostic (the
+    # input the iris-band detector will be built against).
+    if both is not None:
+        save_both_diagnostic(folder, both, int(meta.get("live_rotation", 1)))
 
     # Arm the per-stage debug sink so detect_pupil() records intermediates.
     if DEBUG_MODE in ("stages", "montage"):

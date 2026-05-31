@@ -356,12 +356,51 @@ _LED_MAX_AREA_FRAC = 0.45        # max blob area — bigger means the cover has
                                  # rather than blanking half the eye
 DETECT_EXCLUDE_BOTTOM = 0.0      # manual fallback: blank this bottom fraction
 
+# ── LED-cover CALIBRATION ──
+# The dynamic cover finder above is unreliable when the cover fuses with the
+# eye-socket shadow.  A one-off calibration capture — the LED cover with NO eye
+# in place (ideally the cover against a white background) — locates the cover
+# once, as a fixed mask, so detection can treat that region as known-occluded
+# (ray edges falling in it are the cover boundary, not the pupil, and are
+# dropped).  The mask is stored in the display (rotated) orientation, the same
+# one detection runs in.  Capture it on the Pi with the `calibrate` command.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+COVER_CALIB_DIR = os.path.join(_HERE, "calibration")
+COVER_CALIB_MASK_PATH = os.path.join(COVER_CALIB_DIR, "led_cover_mask.png")
+COVER_CALIB_IMAGE_PATH = os.path.join(COVER_CALIB_DIR, "led_cover_calib.jpg")
+USE_COVER_CALIB = True           # apply the calibrated cover mask if present
+_COVER_CALIB_DARK = 20           # ALMOST-complete-black ceiling: the cover blocks
+                                 # the LED so it reads ~0.  Kept low so only the
+                                 # truly-black cover qualifies — a higher value let
+                                 # dim background in and over-grew the mask
+_COVER_CALIB_MERGE = 25          # close gaps up to ~this (px) so the cover's
+                                 # pointed/curved-triangle blob and its nearby
+                                 # "extra bits" on the same side join into one
+_COVER_CALIB_DILATE = 9          # grow the final mask a little (soft fuzzy edge)
+_COVER_SMOOTH = 15               # close kernel (px) — bridge small edge notches
+_COVER_SMOOTH_OPEN = 45          # open kernel (px) — shave protrusions/peaks that
+                                 # stick out from the main body (bigger = more
+                                 # conservative, hugs the main blob more tightly)
+_COVER_SMOOTH_EPS = 0.012        # contour-fit tolerance (fraction of perimeter) —
+                                 # higher simplifies away small spikes
+_COVER_MASK_CACHE = None         # lazily-loaded (mask_array, shape) cache
+
 # Live mode: only recompute the detection every N frames
 _LIVE_DETECT_SKIP = 5
 
 # Debug — annotate EVERY detected pupil candidate (no plausibility filtering)
 # instead of a single filtered result.  Toggle at runtime with `debug 0` / `debug 1`.
 SWIRSKI_DEBUG = True
+
+# Run pupil detection on the Pi at capture time.  OFF by default for now: the Pi
+# only captures + transfers the raw pair, and detection is run on the dev machine
+# by test_pupil_detection.py.  Toggle at runtime with `pi_detect 1` / `pi_detect 0`.
+PI_DETECT = False
+
+# Build the LED-cover mask on the Pi.  OFF by default: the `c` key / calibrate just
+# captures the calibration IMAGE and uploads it, and the dev machine (receiver.py)
+# builds the mask.  Toggle at runtime with `pi_build_calib 1` / `pi_build_calib 0`.
+PI_BUILD_CALIB = False
 
 # Per-stage debug sink.  When this is a list, detect_pupil() appends a
 # (stage_name, BGR_image) tuple after every pipeline stage so the caller can
@@ -456,6 +495,118 @@ def _apply_exclusions(gray):
         y_ex = int(h * (1.0 - min(0.9, DETECT_EXCLUDE_BOTTOM)))
         g[y_ex:, :] = 255
     return g
+
+
+# ── LED-cover calibration: build / save / load a fixed cover mask ──
+
+def _smooth_fill_cover(mask):
+    """Fill holes inside the cover mask and smooth its outer edge to one contour.
+
+    Morphologically close (bridge edge notches) then open (shave protrusions) to
+    de-jag the boundary, take the largest external contour, fit it
+    (approxPolyDP, `_COVER_SMOOTH_EPS`) and redraw it FILLED — so any black
+    patches enclosed by the cover become part of the mask and the edge is a clean
+    smooth contour rather than the ragged threshold output.
+    """
+    if mask is None or int(cv2.countNonZero(mask)) == 0:
+        return mask
+    kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                   (_COVER_SMOOTH, _COVER_SMOOTH))
+    ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                   (_COVER_SMOOTH_OPEN, _COVER_SMOOTH_OPEN))
+    m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kc)     # bridge small notches
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, ko)         # shave sticking-out peaks
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return mask
+    c = max(cnts, key=cv2.contourArea)
+    c = cv2.approxPolyDP(c, _COVER_SMOOTH_EPS * cv2.arcLength(c, True), True)
+    out = np.zeros_like(mask)
+    cv2.drawContours(out, [c], -1, 255, thickness=-1)   # filled -> holes gone
+    return out
+
+
+def build_cover_mask(bgr_or_gray):
+    """Build the LED-cover mask from a calibration frame (cover, no eye).
+
+    The cover blocks the LED entirely, so it is an **almost completely black**
+    region intruding from one frame edge — a pointed / curved-triangle blob with
+    a few small "extra bits" on the same side.  We threshold only that near-black
+    level (so dim background is NOT picked up), morphologically close so the
+    triangle and its nearby bits merge, then keep the edge-touching component(s).
+    Returns a uint8 mask (255 = cover) in the input orientation/size, or None.
+    """
+    if not CV2_AVAILABLE:
+        return None
+    gray = (bgr_or_gray if bgr_or_gray.ndim == 2
+            else cv2.cvtColor(bgr_or_gray, cv2.COLOR_BGR2GRAY))
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)        # tame background speckle
+    h, w = gray.shape[:2]
+
+    # Almost-complete-black only — this is the key against over-sensitivity.
+    _, dark = cv2.threshold(gray, _COVER_CALIB_DARK, 255, cv2.THRESH_BINARY_INV)
+    # Merge the triangle with its nearby extra bits before labelling.
+    km = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                   (_COVER_CALIB_MERGE, _COVER_CALIB_MERGE))
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, km)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark)
+    if n <= 1:
+        return None
+
+    # Keep the largest near-black blob that touches a frame edge — the cover
+    # intrudes from an edge; stray dark specks elsewhere do not (and are small).
+    min_area = _LED_MIN_AREA_FRAC * h * w
+    best_lbl, best_area = 0, 0
+    for lbl in range(1, n):
+        x = stats[lbl, cv2.CC_STAT_LEFT]; y = stats[lbl, cv2.CC_STAT_TOP]
+        bw = stats[lbl, cv2.CC_STAT_WIDTH]; bh = stats[lbl, cv2.CC_STAT_HEIGHT]
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        touches = (x == 0 or y == 0 or x + bw == w or y + bh == h)
+        if touches and area > min_area and area > best_area:
+            best_lbl, best_area = lbl, area
+    if best_lbl == 0:
+        return None
+
+    mask = np.where(labels == best_lbl, 255, 0).astype(np.uint8)
+    mask = _smooth_fill_cover(mask)                  # fill holes + smooth the edge
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                  (_COVER_CALIB_DILATE, _COVER_CALIB_DILATE))
+    return cv2.dilate(mask, k)                       # grow the soft fuzzy edge
+
+
+def save_cover_calibration(mask, src_bgr=None):
+    """Persist the cover mask (and optionally the source frame) to disk."""
+    if not CV2_AVAILABLE or mask is None:
+        return False
+    os.makedirs(COVER_CALIB_DIR, exist_ok=True)
+    cv2.imwrite(COVER_CALIB_MASK_PATH, mask)
+    if src_bgr is not None:
+        cv2.imwrite(COVER_CALIB_IMAGE_PATH, src_bgr)
+    global _COVER_MASK_CACHE
+    _COVER_MASK_CACHE = None          # invalidate cache so the next load re-reads
+    return True
+
+
+def load_cover_mask(shape):
+    """Load the calibrated cover mask, resized (nearest) to `shape` = (h, w).
+
+    Returns a uint8 mask or None when calibration is disabled or absent.  Cached.
+    """
+    global _COVER_MASK_CACHE
+    if not (USE_COVER_CALIB and CV2_AVAILABLE):
+        return None
+    if _COVER_MASK_CACHE is None:
+        if not os.path.isfile(COVER_CALIB_MASK_PATH):
+            return None
+        m = cv2.imread(COVER_CALIB_MASK_PATH, cv2.IMREAD_GRAYSCALE)
+        _COVER_MASK_CACHE = m
+    m = _COVER_MASK_CACHE
+    if m is None:
+        return None
+    if m.shape[:2] != tuple(shape[:2]):
+        m = cv2.resize(m, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+    return m
 
 
 # ── Swirski detector (commented out — Orlosky is used instead; see below) ──
@@ -1179,7 +1330,7 @@ def _swirski_fit_ellipse(mask, gray_roi, iters):
         return None
 
 
-def _ray_ridges(gray, cx, cy, r_lo, r_hi, gx=None, gy=None):
+def _ray_ridges(gray, cx, cy, r_lo, r_hi, gx=None, gy=None, cover_mask=None):
     """Cast _RAD_N_ANGLES rays from (cx, cy) over radii [r_lo, r_hi); return
     (angles, radii).
 
@@ -1189,6 +1340,10 @@ def _ray_ridges(gray, cx, cy, r_lo, r_hi, gx=None, gy=None):
     where the radial gradient stays near zero, so it drops out).  Using the
     gradient ridge, not an intensity step, locks onto the true boundary and
     ignores the slow violet-glow ramp.  Pass precomputed gx/gy to avoid recompute.
+
+    If `cover_mask` (calibrated LED-cover mask) is given, a ridge whose point
+    falls inside the cover is discarded — that edge is the cover boundary, not
+    the pupil, so it cannot drag the circle fit onto the occluder.
     """
     h, w = gray.shape[:2]
     r_lo = max(3, int(r_lo))
@@ -1213,19 +1368,22 @@ def _ray_ridges(gray, cx, cy, r_lo, r_hi, gx=None, gy=None):
         inner = grad[1:-1]
         cand = np.where((inner > thr) & (inner >= grad[:-2])
                         & (inner > grad[2:]))[0] + 1     # local maxima above thr
-        if len(cand):
-            radii[i] = float(rs[cand[0]])
+        for c in cand:
+            if cover_mask is not None and cover_mask[ys[c], xs[c]] > 0:
+                continue                                 # ridge is on the cover
+            radii[i] = float(rs[c])
+            break
     return angles, radii
 
 
-def _ray_edges(gray, cx, cy, rmin, rmax, r_start=0):
+def _ray_edges(gray, cx, cy, rmin, rmax, r_start=0, cover_mask=None):
     """Pupil-boundary ridges: _ray_ridges over the plausible-pupil radius band.
 
     `r_start` skips the innermost radii (set it past the inpainted-reflex blob).
     """
     r_lo = max(3, int(rmin * 0.5), int(r_start))
     r_hi = int(rmax * _RAD_SEARCH_MULT)
-    return _ray_ridges(gray, cx, cy, r_lo, r_hi)
+    return _ray_ridges(gray, cx, cy, r_lo, r_hi, cover_mask=cover_mask)
 
 
 def _fit_concentric(P, Q):
@@ -1458,6 +1616,13 @@ def detect_pupil(img, live=False):
     rmin = _SW_MIN_R_FRAC * min(h, w)
     rmax = _SW_MAX_R_FRAC * min(h, w)
 
+    # Calibrated LED-cover mask (known occluder region), if a calibration exists.
+    cover_mask = load_cover_mask((h, w))
+    if PUPIL_DEBUG_STAGES is not None and cover_mask is not None:
+        cvis = cv2.cvtColor(green, cv2.COLOR_GRAY2BGR)
+        cvis[cover_mask > 0, 2] = 255           # cover tinted red
+        _dbg("0_cover_calib", cvis)
+
     # ── Stage 1: locate the corneal reflex (anchor) ───────────────────────
     reflex = _find_corneal_reflex(gray)
     if reflex is not None:
@@ -1499,7 +1664,7 @@ def detect_pupil(img, live=False):
     fit = None
     trail = [(cx, cy)]
     for _ in range(_RAD_RECENTRE_ITERS):
-        angles, radii = _ray_edges(work, cx, cy, rmin, rmax, r_start)
+        angles, radii = _ray_edges(work, cx, cy, rmin, rmax, r_start, cover_mask)
         p = _points_from_radii(cx, cy, angles, radii)
         if len(p) < 5:
             break
@@ -1540,7 +1705,8 @@ def detect_pupil(img, live=False):
     # pupil's upper edge was lost.  Adopted only if the iris ring is well covered.
     iris = None
     ia, ir = _ray_ridges(work, int(fcx), int(fcy),
-                         int(r * _IRIS_RP_MIN), int(r * _IRIS_SEARCH_MAX))
+                         int(r * _IRIS_RP_MIN), int(r * _IRIS_SEARCH_MAX),
+                         cover_mask=cover_mask)
     iris_pts = _points_from_radii(fcx, fcy, ia, ir)
     iris_cover = len(iris_pts) / float(_RAD_N_ANGLES)
     if iris_cover >= _IRIS_MIN_COVER and len(pts) >= 5:
@@ -1755,14 +1921,55 @@ def detect_and_annotate(ambient_array, flash_array):
     return img, overlays
 
 
-def transfer_capture(ambient_array, flash_array):
-    """Stage the raw capture pair locally and POST it to the dev machine.
+def _post_to_receiver(folder, filename, data):
+    """POST raw bytes to receiver.py as /upload/<folder>/<filename>.
+
+    Returns True on HTTP 200.  Never raises — a transfer problem must not
+    interrupt capture, streaming or calibration.
+    """
+    url = f"http://{REMOTE_HOST}:{REMOTE_PORT}/upload/{folder}/{filename}"
+    try:
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        with urllib.request.urlopen(req, timeout=TRANSFER_TIMEOUT) as resp:
+            if resp.status != 200:
+                print(f"[TRANSFER ERROR] {folder}/{filename}: HTTP {resp.status}")
+                return False
+        return True
+    except (urllib.error.URLError, OSError) as e:
+        print(f"[TRANSFER ERROR] {folder}/{filename}: {e}")
+        return False
+
+
+def upload_calibration_image(bgr):
+    """POST the (rotated) calibration frame to the dev machine via receiver.py.
+
+    receiver.py routes the special `calibration` folder into its own
+    calibration/ directory and BUILDS the cover mask there (build only on the dev
+    machine).  Returns True on a successful upload.
+    """
+    if not (TRANSFER_ENABLED and CV2_AVAILABLE) or bgr is None:
+        return False
+    ok, buf = cv2.imencode(".jpg", bgr)
+    if not ok:
+        return False
+    fname = os.path.basename(COVER_CALIB_IMAGE_PATH)        # led_cover_calib.jpg
+    if _post_to_receiver("calibration", fname, buf.tobytes()):
+        print(f"Calibration image uploaded to {REMOTE_HOST}.")
+        return True
+    return False
+
+
+def transfer_capture(ambient_array, flash_array, both_array=None):
+    """Stage the raw capture frames locally and POST them to the dev machine.
 
     Writes LOCAL_STAGING_DIR/capture_<timestamp>/{ambient.jpg, flash.jpg,
-    meta.json}, then uploads each file via HTTP POST to receiver.py on the dev
-    machine.  The raw images are saved (no overlay) so the test harness can
-    re-run detection cleanly; meta.json records LIVE_ROTATION so the test
-    rotates exactly as the Pi did.
+    both.jpg, meta.json}, then uploads each via HTTP POST to receiver.py.
+    `both.jpg` (flash+ambient) is included when captured.  The raw images are
+    saved (no overlay) so the test harness can re-run detection cleanly;
+    meta.json records LIVE_ROTATION so the test rotates exactly as the Pi did.
 
     Any failure is reported on the Pi but never raised — a transfer problem
     must not interrupt capture or streaming.
@@ -1772,12 +1979,16 @@ def transfer_capture(ambient_array, flash_array):
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     folder = os.path.join(LOCAL_STAGING_DIR, f"capture_{stamp}")
+    fnames = ["ambient.jpg", "flash.jpg", "meta.json"]
 
-    # ── stage the pair locally ──
+    # ── stage the frames locally ──
     try:
         os.makedirs(folder, exist_ok=True)
         Image.fromarray(ambient_array).save(os.path.join(folder, "ambient.jpg"))
         Image.fromarray(flash_array).save(os.path.join(folder, "flash.jpg"))
+        if both_array is not None:
+            Image.fromarray(both_array).save(os.path.join(folder, "both.jpg"))
+            fnames.insert(2, "both.jpg")
         meta = {
             "timestamp":     stamp,
             "live_rotation": LIVE_ROTATION,
@@ -1788,6 +1999,7 @@ def transfer_capture(ambient_array, flash_array):
             "brightness":    BRIGHTNESS,
             "contrast":      CONTRAST,
             "swirski_debug": SWIRSKI_DEBUG,
+            "has_both":      both_array is not None,
         }
         with open(os.path.join(folder, "meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
@@ -1797,25 +2009,16 @@ def transfer_capture(ambient_array, flash_array):
 
     # ── upload each file to receiver.py on the dev machine ──
     folder_name = f"capture_{stamp}"
-    base_url = f"http://{REMOTE_HOST}:{REMOTE_PORT}/upload/{folder_name}"
     failed = False
-    for fname in ("ambient.jpg", "flash.jpg", "meta.json"):
-        path = os.path.join(folder, fname)
+    for fname in fnames:
         try:
-            with open(path, "rb") as f:
+            with open(os.path.join(folder, fname), "rb") as f:
                 data = f.read()
-            req = urllib.request.Request(
-                f"{base_url}/{fname}",
-                data=data, method="POST",
-                headers={"Content-Type": "application/octet-stream"},
-            )
-            with urllib.request.urlopen(req, timeout=TRANSFER_TIMEOUT) as resp:
-                if resp.status != 200:
-                    print(f"[TRANSFER ERROR] {fname}: HTTP {resp.status}")
-                    failed = True
-        except (urllib.error.URLError, OSError) as e:
-            # URLError covers HTTPError, connection refused, DNS, timeout.
+        except OSError as e:
             print(f"[TRANSFER ERROR] {fname}: {e}")
+            failed = True
+            continue
+        if not _post_to_receiver(folder_name, fname, data):
             failed = True
 
     if not failed:
@@ -1836,37 +2039,46 @@ def _drain_frames(picam2, n=FLUSH_FRAMES):
 
 
 def capture_image(picam2):
-    """Capture a flash + ambient image pair and detect the pupil.
+    """Capture a flash / flash+ambient / ambient triple and (optionally) detect.
 
-    1.  GPIO 17 (flash) lit → capture the retina-flash image first, while the
-        pupil is still maximally dilated.
-    2.  GPIO 27 (ambient) lit → capture the ambient image.  The pupil reads as
-        a dark disc here, suitable for Swirski detection.
-    3.  Detect the pupil in the ambient image with the Swirski method and draw
-        the resulting ellipse onto the flash photo.
+    Three frames in one short LED sequence (the eye barely moves between them):
+      1.  flash only      — retina retroreflection, pupil still dilated
+      2.  flash + ambient — eye structure lit AND the pupil retroreflecting
+      3.  ambient only     — the pupil reads as a dark disc
 
-    The raw ambient image is saved to AMBIENT_PATH; the annotated flash photo
-    to PHOTO_PATH.
+    All three raw frames are transferred to the dev machine.  The raw ambient is
+    saved to AMBIENT_PATH; PHOTO_PATH gets the annotated flash when PI_DETECT is
+    on, else the plain processed flash.
     """
-    print("Capturing flash + ambient pair...")
+    print("Capturing flash / flash+ambient / ambient triple...")
 
     apply_camera_settings(picam2, FLASH_GAIN)
     time.sleep(0.02)
     _drain_frames(picam2)              # let the new gain take effect
 
-    # ───────── FLASH IMAGE (GPIO 17) — first, pupil still dilated ─────────
+    # The three frames share one short LED sequence (one transition each), so the
+    # eye barely moves between them:
+    #   1) flash only       — retina retroreflection, pupil still dilated
+    #   2) flash + ambient   — eye structure lit AND the pupil retroreflecting
+    #                          (eyelid/iris/pupil arcs + a bright pupil in one frame)
+    #   3) ambient only      — the pupil reads as a dark disc
+
+    # ── 1) FLASH ONLY (GPIO 17) ──
     flash_on()
     time.sleep(FLASH_PRE_DELAY)
     _drain_frames(picam2)              # flush frames exposed before LED on
     flash_array = picam2.capture_array()
-    time.sleep(FLASH_DURATION)
-    flash_off()
-    time.sleep(FLASH_POST_DELAY)
 
-    # ───────── AMBIENT IMAGE (GPIO 27) — second ─────────
+    # ── 2) FLASH + AMBIENT (both LEDs) ──
     ambient_on()
     time.sleep(FLASH_PRE_DELAY)
-    _drain_frames(picam2)              # flush frames exposed before LED on
+    _drain_frames(picam2)              # flush frames exposed before ambient on
+    both_array = picam2.capture_array()
+
+    # ── 3) AMBIENT ONLY (GPIO 27) ──
+    flash_off()
+    time.sleep(FLASH_PRE_DELAY)
+    _drain_frames(picam2)              # flush frames exposed before flash off
     ambient_array = picam2.capture_array()
     ambient_off()
 
@@ -1877,16 +2089,17 @@ def capture_image(picam2):
     Image.fromarray(ambient_array).save(AMBIENT_PATH)
 
     # ───────── IMAGE TRANSFER ─────────
-    # Push the raw pair to the dev machine for offline detection testing.
-    transfer_capture(ambient_array, flash_array)
+    # Push the raw triple to the dev machine for offline detection testing.
+    transfer_capture(ambient_array, flash_array, both_array)
 
-    # ───────── PUPIL DETECTION (Orlosky) ─────────
-    if CV2_AVAILABLE:
+    # ───────── PUPIL DETECTION ─────────
+    # Off by default (PI_DETECT): the Pi just captures + transfers, and the dev
+    # machine runs detection on the received pair (test_pupil_detection.py).
+    if PI_DETECT and CV2_AVAILABLE:
         img, overlays = detect_and_annotate(ambient_array, flash_array)
         if not overlays:
             print("No pupil candidates detected.")
     else:
-        print("cv2 not available - pupil detection skipped.")
         img = process_image(flash_array, [])
 
     # Save the annotated flash photo
@@ -1895,12 +2108,52 @@ def capture_image(picam2):
     print("Captured.")
 
 
+def _ship_calibration(bgr):
+    """Upload the calibration image; optionally build the mask locally on the Pi.
+
+    By default (`PI_BUILD_CALIB` off) the Pi only ships the image and the dev
+    machine (receiver.py) builds the mask.  With it on, the Pi also builds, saves
+    and starts using the mask locally.  Returns False only if `bgr` is unusable.
+    """
+    if bgr is None or not CV2_AVAILABLE:
+        print("cv2 not available - cannot calibrate.")
+        return False
+    upload_calibration_image(bgr)
+    if PI_BUILD_CALIB:
+        mask = build_cover_mask(bgr)
+        if mask is not None and save_cover_calibration(mask, bgr):
+            frac = 100.0 * float((mask > 0).sum()) / mask.size
+            print(f"Cover mask built on Pi ({frac:.1f}% of frame).")
+        else:
+            print("Pi cover-mask build FAILED (no dark edge-touching region).")
+    return True
+
+
+def calibrate_cover(picam2):
+    """Capture a calibration frame under the CURRENT lighting (NO eye in place)
+    and ship it to the dev machine, which builds the cover mask.  LEDs are left
+    untouched (whatever is locked/on stays on)."""
+    print("Cover calibration: ensure NO eye is in place...")
+    _drain_frames(picam2)
+    frame = picam2.capture_array()
+    if not CV2_AVAILABLE:
+        print("cv2 not available - cannot calibrate.")
+        return
+    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    rot = _CV2_ROTATIONS[LIVE_ROTATION]
+    if rot is not None:
+        bgr = cv2.rotate(bgr, rot)
+    _ship_calibration(bgr)
+
+
 def streaming_mode(picam2):
     """Live video feed.
 
     SPACE (hold) / r — flash LED (GPIO 17), hold / lock
     a               — toggle ambient LED (GPIO 27)
     p               — toggle live Orlosky pupil detection
+    c               — snap an LED-cover calibration (no eye), instant; ships the
+                      current frame (LEDs left as-is) for the dev machine to build
     ←/→             — rotate the live feed
     ENTER or e      — capture an ambient + flash still
     s               — exit streaming
@@ -1913,7 +2166,7 @@ def streaming_mode(picam2):
         return
 
     print("\nStreaming mode ON")
-    print("SPACE=flash | r=lock | a=ambient | p=pupil-detect | "
+    print("SPACE=flash | r=lock | a=ambient | p=pupil-detect | c=calibrate-cover | "
           "←/→=rotate | ENTER/e=capture | s=exit\n")
 
     apply_camera_settings(picam2, FLASH_GAIN)
@@ -2024,6 +2277,13 @@ def streaming_mode(picam2):
                 print(f"Live pupil detection: "
                       f"{'ON' if swirski_live_on else 'OFF'}")
 
+            # c snaps the current frame as an LED-cover calibration (no eye in
+            # place) and ships it — instant, no confirm, LEDs left as locked/on.
+            elif key == ord('c'):
+                _ship_calibration(frame.copy())
+                _overlay_cache = None          # cover may change -> redetect
+                print("Calibration captured.")
+
             # Arrow keys: left=CCW step, right=CW step
             elif key == 65361:  # left arrow
                 LIVE_ROTATION = (LIVE_ROTATION - 1) % 4
@@ -2066,6 +2326,8 @@ def handle_parameter_command(cmd, picam2):
     global CONTRAST
     global DETECT_EXCLUDE_BOTTOM
     global SWIRSKI_DEBUG
+    global PI_DETECT
+    global PI_BUILD_CALIB
 
     parts = cmd.split()
 
@@ -2141,6 +2403,12 @@ def handle_parameter_command(cmd, picam2):
 
         elif param == "debug":
             SWIRSKI_DEBUG = bool(int(value))
+
+        elif param == "pi_detect":
+            PI_DETECT = bool(int(value))
+
+        elif param == "pi_build_calib":
+            PI_BUILD_CALIB = bool(int(value))
 
         else:
             print("Unknown parameter.")
@@ -2220,10 +2488,11 @@ def main():
         except Exception:
             pass
 
-        print("ENTER = capture (ambient + flash, with pupil detection)")
-        print("s     = streaming mode (SPACE=flash, r=lock, a=ambient, "
+        print("ENTER     = capture (ambient + flash, with pupil detection)")
+        print("s         = streaming mode (SPACE=flash, r=lock, a=ambient, "
               "p=pupil-detect, e/ENTER=capture)")
-        print("q     = quit\n")
+        print("calibrate = snap an LED-cover calibration (no eye); ships it to build here")
+        print("q         = quit\n")
 
         # ───────── MAIN LOOP ─────────
 
@@ -2240,6 +2509,12 @@ def main():
 
             elif cmd == "":
                 capture_image(picam2)
+
+            # LED-cover calibration (no eye in place) — captures under the current
+            # lighting and ships the image; the dev machine builds the mask.
+
+            elif cmd == "calibrate":
+                calibrate_cover(picam2)
 
             # Streaming mode
 

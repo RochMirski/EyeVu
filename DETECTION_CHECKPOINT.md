@@ -1,3 +1,44 @@
+At the next attempt at improving the algorithm, add the ability for the capture of a calibration image which will allow for the detection of the placement of the led cover, without the eye in place.
+
+# Three-frame capture + arc / eye-structure plan (2026-05-31)
+
+**Capture now grabs three frames** in one short LED sequence (eye barely moves):
+flash-only → **flash+ambient (both)** → ambient-only (`capture_image`). All three are
+transferred (`ambient.jpg`, `flash.jpg`, `both.jpg`, `meta.json`; `meta.has_both`). The
+combined `both.jpg` is the key new asset: a **bright retroreflecting pupil** *plus*
+ambient-lit eyelid/iris structure in one frame.
+
+**Arc-detection feasibility (investigated on existing ambient frames):** naive
+Canny + HoughCircles is **unreliable** here — the pupil/iris boundary is a weak partial
+arc, eyelid edges are fragmented, and Hough returns spurious large circles (only the
+clearest frame landed on the pupil). Conclusion: an off-the-shelf arc detector won't carry
+an eye-structure model on ambient-alone data. The current detector already *is* a targeted
+pupil-arc fitter (radial gradient ridges → circle on the visible arc + gated concentric
+iris), which is more robust than Hough here.
+
+**Iris-band concentric detector (approved 2026-05-31, gated on `both.jpg` data).**
+On a heavily-obstructed frame the radial edge cluster brackets the iris band (pupil edge
+inside, limbus outside); fit the two as **concentric** circles so the larger iris arc pins
+the centre/pupil when the pupil itself is occluded — **output both pupil and iris circles**.
+On `both.jpg` the pupil retroreflects bright (best in RED) and the limbus is ambient-lit
+(best in GREEN), and the two boundaries differ by gradient **sign** (pupil bright→dark,
+limbus dark→bright) — that separates the rings cleanly, unlike ambient-alone. Build by
+generalising `_ray_ridges` (signed, two ridges/ray) + reusing `_fit_concentric`; gate on
+annulus consistency with fallback to today's pupil-only fit. Full plan:
+`~/.claude/plans/wondrous-sparking-trinket.md`. **Harness is ready**: `test_pupil_detection.py`
+loads `both.jpg` when present and writes `both_diag.jpg` (Red | Green | grad-mag) to design
+against; the detector itself waits on real combined captures.
+
+**Plan for heavy obstruction (needs the new `both.jpg` data to develop/validate):**
+model the eye as **concentric arcs at three scales** — eyelid (large-radius arcs, only
+top/bottom visible), iris/limbus (medium), pupil (small) — sharing the iris/pupil centre.
+Fit each from whatever arc is visible and use the larger, better-supported arcs (eyelid
+aperture, iris) to constrain the pupil centre when the pupil itself is mostly occluded. The
+combined frame should give cleaner edges (bright pupil anchor + lit structure) than the
+ambient-only frames that defeated Hough above. Defer building until `both.jpg` captures
+exist; extend the radial-ridge machinery (multi-ridge per ray → group into arcs) rather
+than Hough.
+
 # Pupil-detection checkpoint — 2026-05-30
 
 Snapshot of the pupil-detection rework in [cap.py](cap.py) (`detect_pupil`) and the
@@ -138,6 +179,45 @@ original "red eye pupil detection" direction (see `blob_detection.py`).
 **Decision (resolved):** move to ambient+flash fusion — implemented above. Occluded frames
 that neither cue resolves are flagged low-confidence for re-capture (operator can retake).
 
+## LED-cover calibration (2026-05-31, implemented)
+
+A one-off **calibration capture of the LED cover with no eye in place** (ideally the cover
+against a white background) now locates the cover as a fixed mask, so detection treats that
+region as *known-occluded* instead of guessing per-frame. This replaces reliance on the
+fragile dynamic `_find_led_cover_mask` (which bails when the cover fuses with the socket).
+
+- **Build / store / load** (`cap.py`): `build_cover_mask(frame)` infers the cover as the
+  **largest near-black (`_COVER_CALIB_DARK`), edge-touching** component — the cover blocks
+  the LED so it reads ~0 and intrudes from a frame edge, so this needs no perfectly
+  white/uniform background (an off-white or noisy backdrop is merely brighter; stray dark
+  specks that don't touch an edge are ignored). → `save_cover_calibration()` →
+  `calibration/led_cover_mask.png`, stored in the display (rotated) orientation.
+  `load_cover_mask((h,w))` is cached and resizes to the frame. Toggle `USE_COVER_CALIB`.
+- **Capture**: easiest is **live mode** — press **`c`**, which grabs a no-eye frame, shows
+  the inferred cover tinted over the image, and waits (**y/ENTER = save, any key = cancel**).
+  The `calibrate` command does the same non-interactively. On the dev side,
+  `build_cover_calibration.py <image> [--rot N]` converts a calibration image to the mask.
+- **Reaches this machine automatically**: after a Pi calibration saves, `upload_calibration()`
+  POSTs the mask to the receiver under the special `calibration` folder; `receiver.py` routes
+  that to its own `calibration/` dir (== `cap.COVER_CALIB_DIR`), so the dev-side harness loads
+  the same mask with no manual copy. Verified end-to-end (POST → receiver → `load_cover_mask`).
+
+## Pi-side processing OFF by default (2026-05-31)
+
+`PI_DETECT = False`: `capture_image` now just captures + transfers the raw pair (no on-Pi
+detection); detection runs on the dev machine via `test_pupil_detection.py` on the received
+captures. Re-enable on the Pi at runtime with `pi_detect 1`. (Live-mode `p` overlay is
+unchanged and still available for a quick visual check.)
+- **Use in detection**: `_ray_ridges` takes the cover mask and **drops any boundary ridge
+  whose point falls inside the cover** — those are the cover/eye edge, not the pupil, so they
+  can no longer drag the circle fit onto the occluder. A `0_cover_calib` debug stage shows
+  the mask. With **no calibration present, everything is a clean no-op** (graceful default).
+
+Note: the throwaway "derive the cover from the median of existing captures" idea was dropped
+— the underexposed ambient frames are dark almost everywhere, so it couldn't isolate the
+cover from the general gloom (it masked ~37–60% of the frame). A real white-background
+calibration shot (user-supplied) isolates the cover cleanly; that's the supported path.
+
 ## Known issues / next steps
 
 1. **Centre bias / partial arc.** The pupil's upper edge is missing, so the circle centre
@@ -155,4 +235,5 @@ that neither cue resolves are flagged low-confidence for re-capture (operator ca
 `_REFLEX_*` (anchor); `_RAD_N_ANGLES`, `_RAD_SEARCH_MULT`, `_RAD_GRAD_K`,
 `_RAD_RECENTRE_ITERS`, `_RAD_MIN_COVER`, `_RAD_INLIER_PX` (pupil ridge + circle fit);
 `_IRIS_RP_MIN/MAX`, `_IRIS_SEARCH_MAX`, `_IRIS_MIN_COVER`, `_IRIS_MAX_RMS_FRAC` (concentric
-refine); `_SW_MIN_R_FRAC`/`_SW_MAX_R_FRAC` (pupil radius bounds as a fraction of min(h, w)).
+refine); `_SW_MIN_R_FRAC`/`_SW_MAX_R_FRAC` (pupil radius bounds as a fraction of min(h, w));
+`USE_COVER_CALIB`, `_COVER_CALIB_DARK`, `_COVER_CALIB_DILATE` (LED-cover calibration).
