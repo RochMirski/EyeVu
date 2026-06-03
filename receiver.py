@@ -27,9 +27,11 @@ Anything else returns 400.  No auth — only listen on a trusted local network
 (e.g. this machine's Windows mobile hotspot, where the Pi is the only client).
 """
 
+import csv
 import os
 import re
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -44,6 +46,167 @@ TRANSFERS_DIR = os.path.join(HERE, "Transfers")
 CALIBRATION_FOLDER = "calibration"
 CALIBRATION_DIR = os.path.join(HERE, "calibration")
 CALIB_IMAGE_NAME = "led_cover_calib.jpg"   # the raw calibration frame the Pi ships
+
+
+# ── Alignment guidance on received captures ───────────────────────────────
+# When a capture folder has its full triple, run the coarse-locate cascade
+# (ridge + red-eye + RITnet — RITnet runs fine here on the PC) and tell the
+# operator which way to move the device.  One tracker, updated in arrival order,
+# gives relative phrasing across the session ("keep going" / "almost there").
+GUIDANCE_TARGET_MODE = "centre"        # "centre" now; "cover_top_mid" later
+_GUIDANCE = None
+_GUIDANCE_PRIOR = None
+_PROCESSED = set()
+
+# Completed captures are sorted into these subfolders of Transfers/ by which
+# detector(s) found the pupil (see cap.classify_detection).
+CATEGORY_DIRS = ("no_pupil", "ridge_only", "ritnet_only", "both")
+
+# Per-capture detection log appended to Transfers/index.csv (raw centres +
+# confidences from both detectors, the category, and the guidance instruction).
+_INDEX_LOCK = threading.Lock()
+_INDEX_FIELDS = [
+    "folder", "category",
+    "ridge_x", "ridge_y", "ridge_conf", "ridge_source",
+    "ritnet_x", "ritnet_y", "ritnet_conf",
+    "agree_dist", "chosen_source", "chosen_x", "chosen_y",
+    "off_px", "state", "instruction", "target_x", "target_y", "live_rotation",
+]
+
+
+def _append_index_row(row):
+    """Append one detection record to Transfers/index.csv (thread-safe)."""
+    path = os.path.join(TRANSFERS_DIR, "index.csv")
+    with _INDEX_LOCK:
+        try:
+            os.makedirs(TRANSFERS_DIR, exist_ok=True)
+            new = not os.path.isfile(path)
+            with open(path, "a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=_INDEX_FIELDS)
+                if new:
+                    w.writeheader()
+                w.writerow(row)
+        except OSError as e:
+            print(f"  index.csv write error: {e}")
+
+
+def _maybe_run_guidance(folder, dest_dir):
+    """Run guidance + categorise/sort once a folder has ambient + flash + meta."""
+    if folder in _PROCESSED:
+        return
+    need = ("ambient.jpg", "flash.jpg", "meta.json")
+    if not all(os.path.isfile(os.path.join(dest_dir, n)) for n in need):
+        return
+    _PROCESSED.add(folder)
+    try:
+        category = _run_guidance(folder, dest_dir)
+        if category:
+            _sort_capture(folder, dest_dir, category)
+    except Exception as e:                       # noqa: BLE001 — never crash receiver
+        print(f"  guidance error: {e}")
+
+
+def _run_guidance(folder, dest_dir):
+    """Detect on the received triple; print/draw guidance; return the category.
+
+    Runs the ridge cascade and RITnet separately (cap.detect_both) and sorts the
+    capture by which found the pupil (cap.classify_detection); the chosen result
+    also drives the alignment guidance.  Returns the category string.
+    """
+    global _GUIDANCE, _GUIDANCE_PRIOR
+    import json
+    import numpy as np
+    from PIL import Image
+    import cap
+    import guidance
+    cv2 = cap.cv2
+    if _GUIDANCE is None:
+        _GUIDANCE = guidance.GuidanceTracker()
+
+    meta = {}
+    try:
+        with open(os.path.join(dest_dir, "meta.json")) as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        pass
+    if "live_rotation" in meta:
+        cap.LIVE_ROTATION = int(meta["live_rotation"])
+
+    amb = np.array(Image.open(os.path.join(dest_dir, "ambient.jpg")).convert("RGB"))
+    fla = np.array(Image.open(os.path.join(dest_dir, "flash.jpg")).convert("RGB"))
+    rot = cap._CV2_ROTATIONS[cap.LIVE_ROTATION]
+    amb_bgr = cv2.cvtColor(amb, cv2.COLOR_RGB2BGR)
+    fla_bgr = cv2.cvtColor(fla, cv2.COLOR_RGB2BGR)
+    if rot is not None:
+        amb_bgr = cv2.rotate(amb_bgr, rot)
+        fla_bgr = cv2.rotate(fla_bgr, rot)
+
+    cover = cap.load_cover_mask(amb_bgr.shape[:2])
+
+    # Run the two detectors separately and categorise this capture.
+    ridge, ritnet = cap.detect_both(amb_bgr, fla_bgr, cover, _GUIDANCE_PRIOR,
+                                    allow_ml=True)
+    category, chosen = cap.classify_detection(ridge, ritnet, amb_bgr.shape)
+    center = chosen[0] if chosen else None
+    conf = chosen[2] if chosen else 0.0
+    source = chosen[3] if chosen else ""
+
+    target = guidance.target_point(fla_bgr.shape, cover, GUIDANCE_TARGET_MODE)
+    g = _GUIDANCE.update(center, fla_bgr.shape, target, conf, source)
+    _GUIDANCE_PRIOR = center if center is not None else _GUIDANCE_PRIOR
+
+    rs = f"{ridge[2]:.2f}" if ridge else "-"
+    ns = f"{ritnet[2]:.2f}" if ritnet else "-"
+    print(f"  >>> GUIDANCE [{folder}]: {g.instruction}"
+          + (f"  (off={g.distance:.0f}px {source} conf={conf:.2f})" if center else ""))
+    print(f"  >>> CATEGORY [{folder}]: {category}  (ridge conf={rs}, ritnet conf={ns})")
+    vis = guidance.annotate(cv2.convertScaleAbs(fla_bgr, alpha=3.0), g, target, center)
+    cv2.imwrite(os.path.join(dest_dir, "guidance.jpg"), vis)
+
+    # Log the raw detection numbers (both detectors) to Transfers/index.csv.
+    def _xy(d):                                  # (x, y) or ("", "")
+        return (round(d[0][0], 1), round(d[0][1], 1)) if d else ("", "")
+    agree = (round(float(np.hypot(ridge[0][0] - ritnet[0][0],
+                                  ridge[0][1] - ritnet[0][1])), 1)
+             if ridge and ritnet else "")
+    rx, ry = _xy(ridge)
+    nx, ny = _xy(ritnet)
+    _append_index_row({
+        "folder": folder, "category": category,
+        "ridge_x": rx, "ridge_y": ry,
+        "ridge_conf": round(ridge[2], 3) if ridge else "",
+        "ridge_source": ridge[3] if ridge else "",
+        "ritnet_x": nx, "ritnet_y": ny,
+        "ritnet_conf": round(ritnet[2], 3) if ritnet else "",
+        "agree_dist": agree, "chosen_source": source,
+        "chosen_x": round(center[0], 1) if center else "",
+        "chosen_y": round(center[1], 1) if center else "",
+        "off_px": round(g.distance, 1) if center else "",
+        "state": g.state, "instruction": g.instruction,
+        "target_x": target[0], "target_y": target[1],
+        "live_rotation": cap.LIVE_ROTATION,
+    })
+    return category
+
+
+def _sort_capture(folder, dest_dir, category):
+    """Move a completed capture folder into Transfers/<category>/<folder>."""
+    import shutil
+    target_parent = os.path.join(TRANSFERS_DIR, category)
+    target = os.path.join(target_parent, folder)
+    if os.path.abspath(dest_dir) == os.path.abspath(target):
+        return
+    os.makedirs(target_parent, exist_ok=True)
+    try:
+        if os.path.isdir(target):                # merge into an existing target
+            for fn in os.listdir(dest_dir):
+                shutil.move(os.path.join(dest_dir, fn), os.path.join(target, fn))
+            os.rmdir(dest_dir)
+        else:
+            shutil.move(dest_dir, target)
+        print(f"  sorted {folder} -> {category}/")
+    except OSError as e:
+        print(f"  sort error ({folder} -> {category}): {e}")
 
 
 def _build_cover_mask_from(image_path):
@@ -129,7 +292,12 @@ class UploadHandler(BaseHTTPRequestHandler):
         # cv2 / build failure never takes the receiver down.
         if folder == CALIBRATION_FOLDER and filename == CALIB_IMAGE_NAME:
             _build_cover_mask_from(dest)
-        self._reply(200, "ok")
+        self._reply(200, "ok")        # ack the Pi before any heavy detection
+
+        # Once the capture triple is complete, run alignment guidance (off the
+        # response path so RITnet inference never blocks the upload).
+        if folder != CALIBRATION_FOLDER:
+            _maybe_run_guidance(folder, dest_dir)
 
     def _reply(self, status, msg):
         body = (msg + "\n").encode("utf-8")

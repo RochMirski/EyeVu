@@ -21,6 +21,8 @@ SPACE (hold)        Flash LED (GPIO 17) on
 r                   Toggle flash LED lock on/off
 a                   Toggle ambient LED (GPIO 27) on/off
 p                   Toggle live Orlosky pupil detection
+t                   Toggle PC image transfer (HTTP-POST to receiver.py)
+f                   Flip to the other eye (cover top<->bottom, 180°)
 ←/→                 Rotate live feed
 ENTER or e          Capture still
 s                   Exit streaming
@@ -83,6 +85,15 @@ except ImportError:
     CV2_AVAILABLE = False
     print("Warning: cv2 not available.")
 
+try:
+    print("Checking RITnet availability...")
+    import ritnet_infer
+    RITNET_AVAILABLE = ritnet_infer.available()
+except Exception as e:
+    RITNET_AVAILABLE = False
+    ritnet_infer = None
+    print(f"Warning: ritnet_infer not available ({e}).")
+
 # ───────── CONFIG ─────────
 
 LED_PIN   = 17     # flash LED   — retina retroreflection capture
@@ -90,6 +101,13 @@ LED_PIN_2 = 27     # ambient LED — diffuse light for pupil detection
 
 PHOTO_PATH   = "/tmp/retina_preview.jpg"   # annotated flash photo
 AMBIENT_PATH = "/tmp/retina_ambient.jpg"   # raw ambient image (Swirski input)
+
+# Open an external image viewer (xdg-open) on PHOTO_PATH at startup.  OFF by
+# default — the alignment-guidance cv2 window is the live view now.  The annotated
+# flash is still saved to PHOTO_PATH and the raw high-res frames are still
+# transferred; only the auto-opened preview window is suppressed.  Toggle at
+# runtime with `preview 1` / `preview 0`.
+PREVIEW_VIEWER = False
 
 # ───────── IMAGE TRANSFER ─────────
 # Each capture's raw ambient + flash pair is HTTP-POSTed to the dev machine's
@@ -247,6 +265,14 @@ def print_settings():
     print(f"exclude_bottom     = {DETECT_EXCLUDE_BOTTOM}")
     print(f"debug              = {SWIRSKI_DEBUG}")
 
+    print()
+
+    print(f"transfer           = {'ON' if TRANSFER_ENABLED else 'OFF'}")
+    print(f"preview            = {'ON' if PREVIEW_VIEWER else 'OFF'}")
+    print(f"pi_detect          = {'ON' if PI_DETECT else 'OFF'}")
+    print(f"use_cover          = {'ON' if USE_COVER_CALIB else 'OFF'}")
+    print(f"cover_side         = {COVER_SIDE}  (rotation {LIVE_ROTATION * 90}°)")
+
     print("────────────────────────\n")
 
 
@@ -362,12 +388,15 @@ DETECT_EXCLUDE_BOTTOM = 0.0      # manual fallback: blank this bottom fraction
 # in place (ideally the cover against a white background) — locates the cover
 # once, as a fixed mask, so detection can treat that region as known-occluded
 # (ray edges falling in it are the cover boundary, not the pupil, and are
-# dropped).  The mask is stored in the display (rotated) orientation, the same
-# one detection runs in.  Capture it on the Pi with the `calibrate` command.
+# dropped).  The mask is stored in the display orientation it was calibrated in
+# (alongside that LIVE_ROTATION in a .rot sidecar); load_cover_mask rotates it to
+# the current orientation so it stays aligned after an eye/orientation flip.
+# Capture it on the Pi with the `calibrate` command.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 COVER_CALIB_DIR = os.path.join(_HERE, "calibration")
 COVER_CALIB_MASK_PATH = os.path.join(COVER_CALIB_DIR, "led_cover_mask.png")
 COVER_CALIB_IMAGE_PATH = os.path.join(COVER_CALIB_DIR, "led_cover_calib.jpg")
+COVER_CALIB_ROT_PATH = os.path.join(COVER_CALIB_DIR, "led_cover_mask.rot")
 USE_COVER_CALIB = True           # apply the calibrated cover mask if present
 _COVER_CALIB_DARK = 20           # ALMOST-complete-black ceiling: the cover blocks
                                  # the LED so it reads ~0.  Kept low so only the
@@ -384,6 +413,15 @@ _COVER_SMOOTH_OPEN = 45          # open kernel (px) — shave protrusions/peaks 
 _COVER_SMOOTH_EPS = 0.012        # contour-fit tolerance (fraction of perimeter) —
                                  # higher simplifies away small spikes
 _COVER_MASK_CACHE = None         # lazily-loaded (mask_array, shape) cache
+_COVER_CALIB_ROT_CACHE = None    # LIVE_ROTATION the stored mask was calibrated at
+
+# Cover side: which edge of the working (display) image the LED cover intrudes
+# from — "top" for the left eye (default), "bottom" for the right eye.  The two
+# eyes differ by a 180° rig rotation, so switching eye just adds 180° to
+# LIVE_ROTATION; the cover mask is rotated to match in load_cover_mask, and the
+# detection geometry auto-detects the cover side from the mask, so it adapts
+# either way.  Set at startup (prompt) and toggled live with `f` / `cover_side`.
+COVER_SIDE = "top"
 
 # Live mode: only recompute the detection every N frames
 _LIVE_DETECT_SKIP = 5
@@ -414,6 +452,15 @@ PUPIL_DEBUG_STAGES = None
 _LAST_ANCHOR = None
 _LAST_PUPIL = None
 _LAST_CONF = 0.0
+
+# Alignment-guidance state (used by capture_image when PI_DETECT is on).  The
+# tracker carries the previous capture's offset for relative phrasing; the prior
+# is the last pupil centre (display orientation) that seeds the next search.
+_GUIDANCE_TRACKER = None
+_GUIDANCE_PRIOR = None
+GUIDANCE_TARGET_MODE = "centre"        # "centre" now; "cover_top_mid" later
+GUIDANCE_USE_ML = True                 # let coarse_locate try RITnet (if present)
+GUIDANCE_WINDOW = "Alignment Guidance" # Pi cv2 window the annotated capture is shown in
 
 
 def _dbg(name, img):
@@ -576,16 +623,40 @@ def build_cover_mask(bgr_or_gray):
 
 
 def save_cover_calibration(mask, src_bgr=None):
-    """Persist the cover mask (and optionally the source frame) to disk."""
+    """Persist the cover mask (and optionally the source frame) to disk.
+
+    Also records the LIVE_ROTATION the mask was calibrated at, so load_cover_mask
+    can rotate it back into whatever orientation is active later (eye flip).
+    """
     if not CV2_AVAILABLE or mask is None:
         return False
     os.makedirs(COVER_CALIB_DIR, exist_ok=True)
     cv2.imwrite(COVER_CALIB_MASK_PATH, mask)
     if src_bgr is not None:
         cv2.imwrite(COVER_CALIB_IMAGE_PATH, src_bgr)
-    global _COVER_MASK_CACHE
+    try:
+        with open(COVER_CALIB_ROT_PATH, "w") as fh:
+            fh.write(str(LIVE_ROTATION))
+    except OSError:
+        pass
+    global _COVER_MASK_CACHE, _COVER_CALIB_ROT_CACHE
     _COVER_MASK_CACHE = None          # invalidate cache so the next load re-reads
+    _COVER_CALIB_ROT_CACHE = None
     return True
+
+
+def _cover_calib_rotation():
+    """LIVE_ROTATION the stored mask was calibrated at (0 if no .rot sidecar)."""
+    global _COVER_CALIB_ROT_CACHE
+    if _COVER_CALIB_ROT_CACHE is None:
+        rot = 0
+        try:
+            with open(COVER_CALIB_ROT_PATH) as fh:
+                rot = int(fh.read().strip()) % 4
+        except (OSError, ValueError):
+            rot = 0                   # legacy mask, no sidecar -> assume no delta
+        _COVER_CALIB_ROT_CACHE = rot
+    return _COVER_CALIB_ROT_CACHE
 
 
 def load_cover_mask(shape):
@@ -604,6 +675,12 @@ def load_cover_mask(shape):
     m = _COVER_MASK_CACHE
     if m is None:
         return None
+    # Rotate the stored mask from its calibration orientation into the current
+    # display orientation, so it stays aligned with frames after an eye flip.
+    delta = (LIVE_ROTATION - _cover_calib_rotation()) % 4
+    rot = _CV2_ROTATIONS[delta]
+    if rot is not None:
+        m = cv2.rotate(m, rot)
     if m.shape[:2] != tuple(shape[:2]):
         m = cv2.resize(m, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
     return m
@@ -1921,6 +1998,122 @@ def detect_and_annotate(ambient_array, flash_array):
     return img, overlays
 
 
+def coarse_locate(ambient_bgr, flash_bgr, cover_mask=None, prior=None,
+                  allow_ml=True):
+    """Coarse pupil centre via a confidence-ranked cascade — for alignment guidance.
+
+    Runs the cheap cues always (ambient dark-disc ridge fit + flash red-eye, fused
+    by _fuse_pupil) and, when torch + RITnet weights are present, RITnet too; keeps
+    the highest-confidence result.  `prior` (last known centre) seeds the red-eye
+    window and the RITnet crop and is the fallback when every cue fails.  Inputs
+    are BGR in display (rotated) orientation.  Returns
+    (center_xy, radius_or_None, confidence, source) or None.
+
+    Only a coarse centre is needed during approach (to steer the device); the exact
+    outline doesn't matter until the pupil is centred and the fundus appears.
+    """
+    if not CV2_AVAILABLE:
+        return None
+    ridge, ritnet = detect_both(ambient_bgr, flash_bgr, cover_mask, prior, allow_ml)
+    candidates = [c for c in (ridge, ritnet) if c is not None]
+    if not candidates:
+        if prior is not None:
+            return ((float(prior[0]), float(prior[1])), None, 0.0, "prior")
+        return None
+    return max(candidates, key=lambda c: c[2])
+
+
+# Two centres "agree" when within this fraction of the smaller frame dimension.
+DETECT_AGREE_FRAC = 0.10
+
+
+def detect_both(ambient_bgr, flash_bgr, cover_mask=None, prior=None, allow_ml=True):
+    """Run the cheap ridge/red-eye cascade and RITnet SEPARATELY (not fused).
+
+    Returns (ridge, ritnet); each is (center_xy, radius, confidence, source) or
+    None.  `ridge` is the ambient dark-disc + flash red-eye cue fused by
+    _fuse_pupil (the "traditional CV" result); `ritnet` is the ML segmentation
+    (guarded — None where torch / weights are absent).  This is what
+    coarse_locate ranks, and what classify_detection() uses to sort a capture by
+    which detector(s) found the pupil.
+    """
+    if not CV2_AVAILABLE:
+        return None, None
+    h, w = ambient_bgr.shape[:2]
+    rmin = _SW_MIN_R_FRAC * min(h, w)
+    rmax = _SW_MAX_R_FRAC * min(h, w)
+
+    # ── Ridge: ambient dark-disc fit (stashes _LAST_PUPIL/_LAST_CONF/_LAST_ANCHOR)
+    #    fused with the flash red-eye, seeded by the reflex anchor or the prior.
+    detect_pupil(ambient_bgr)
+    amb_pupil, amb_conf, anchor = _LAST_PUPIL, _LAST_CONF, _LAST_ANCHOR
+    seed = anchor if anchor is not None else (
+        (int(prior[0]), int(prior[1])) if prior is not None else None)
+    redeye = detect_redeye(flash_bgr, seed[0], seed[1], rmin, rmax) \
+        if seed is not None else None
+    fused = _fuse_pupil(amb_pupil, amb_conf, redeye)
+    ridge = None
+    if fused is not None:
+        cx, cy, r, source, _confident = fused
+        conf = amb_conf if source.startswith("ambient") else (
+            min(1.0, redeye[3] / 255.0) if redeye is not None else amb_conf)
+        ridge = ((float(cx), float(cy)), float(r), float(conf), source)
+
+    # ── RITnet (optional; only where torch + weights are available) ──
+    ritnet = None
+    if allow_ml and RITNET_AVAILABLE:
+        """try:
+            import ritnet_infer
+        except Exception as e:                 # noqa: BLE001  (module not deployed)
+            print(f"Error loading ritnet_infer: {e}")
+            ritnet_infer = None"""
+        if ritnet_infer is not None and ritnet_infer.available():
+            green = ambient_bgr[:, :, 1]
+            if cover_mask is not None and int(cv2.countNonZero(cover_mask)):
+                green = cv2.inpaint(green, cover_mask, 15, cv2.INPAINT_TELEA)
+            reflex = _find_corneal_reflex(green)
+            reflex_mask = reflex[3] if reflex is not None else None
+            ranch = (reflex[0], reflex[1]) if reflex is not None else anchor
+            # Crop centre: prior (tracking) -> tangent past the cover (initial)
+            # -> the ridge centre -> the reflex anchor.
+            if prior is not None:
+                cc = prior
+            elif cover_mask is not None and int(cv2.countNonZero(cover_mask)):
+                cc = ritnet_infer.tangent_crop_center(cover_mask, (h, w))
+            elif ridge is not None:
+                cc = ridge[0]
+            else:
+                cc = ranch
+            rr = ritnet_infer.locate(green, reflex_mask=reflex_mask, anchor=ranch,
+                                     crop_center=cc)
+            if rr.ok and rr.center is not None:
+                ritnet = (rr.center, rr.radius, float(rr.confidence), "ritnet")
+    return ridge, ritnet
+
+
+def classify_detection(ridge, ritnet, shape, agree_frac=DETECT_AGREE_FRAC):
+    """Categorise a capture by which detector(s) found the pupil.
+
+    Returns (category, chosen) where category is one of
+    ``"no_pupil" | "ridge_only" | "ritnet_only" | "both"`` and `chosen` is the
+    (center, radius, conf, source) to use downstream (or None).  When both fire
+    and AGREE (centres within agree_frac x min(h,w)) it is "both" (higher-conf of
+    the two is chosen); when both fire but DISAGREE, the higher-confidence one
+    wins and the category collapses to that detector's "*_only".
+    """
+    if ridge is None and ritnet is None:
+        return "no_pupil", None
+    if ritnet is None:
+        return "ridge_only", ridge
+    if ridge is None:
+        return "ritnet_only", ritnet
+    h, w = shape[:2]
+    dist = float(np.hypot(ridge[0][0] - ritnet[0][0], ridge[0][1] - ritnet[0][1]))
+    if dist <= agree_frac * min(h, w):
+        return "both", (ridge if ridge[2] >= ritnet[2] else ritnet)
+    return ("ridge_only", ridge) if ridge[2] >= ritnet[2] else ("ritnet_only", ritnet)
+
+
 def _post_to_receiver(folder, filename, data):
     """POST raw bytes to receiver.py as /upload/<folder>/<filename>.
 
@@ -2092,13 +2285,13 @@ def capture_image(picam2):
     # Push the raw triple to the dev machine for offline detection testing.
     transfer_capture(ambient_array, flash_array, both_array)
 
-    # ───────── PUPIL DETECTION ─────────
+    # ───────── PUPIL DETECTION + ALIGNMENT GUIDANCE ─────────
     # Off by default (PI_DETECT): the Pi just captures + transfers, and the dev
-    # machine runs detection on the received pair (test_pupil_detection.py).
+    # machine (receiver.py) runs detection + guidance on the received triple.
+    # When PI_DETECT is on, run the coarse-locate cascade here (capture time only,
+    # never in live preview) and tell the operator which way to move the device.
     if PI_DETECT and CV2_AVAILABLE:
-        img, overlays = detect_and_annotate(ambient_array, flash_array)
-        if not overlays:
-            print("No pupil candidates detected.")
+        img = _guide_capture(ambient_array, flash_array)
     else:
         img = process_image(flash_array, [])
 
@@ -2106,6 +2299,55 @@ def capture_image(picam2):
     img.save(PHOTO_PATH)
 
     print("Captured.")
+
+
+def _guide_capture(ambient_array, flash_array):
+    """Run coarse_locate + alignment guidance on one capture; return annotated PIL.
+
+    Stateful across captures (module-level tracker + prior) so the instruction can
+    refine relative to the previous move ("keep going" / "almost there").
+    """
+    global _GUIDANCE_TRACKER, _GUIDANCE_PRIOR
+    import guidance
+    if _GUIDANCE_TRACKER is None:
+        _GUIDANCE_TRACKER = guidance.GuidanceTracker()
+
+    rot = _CV2_ROTATIONS[LIVE_ROTATION]
+    amb_bgr = cv2.cvtColor(ambient_array, cv2.COLOR_RGB2BGR)
+    flash_bgr = cv2.cvtColor(flash_array, cv2.COLOR_RGB2BGR)
+    if rot is not None:
+        amb_bgr = cv2.rotate(amb_bgr, rot)
+        flash_bgr = cv2.rotate(flash_bgr, rot)
+
+    cover_mask = load_cover_mask(amb_bgr.shape[:2])
+    res = coarse_locate(amb_bgr, flash_bgr, cover_mask, _GUIDANCE_PRIOR,
+                        allow_ml=GUIDANCE_USE_ML)
+    center = res[0] if res else None
+    conf = res[2] if res else 0.0
+    source = res[3] if res else ""
+
+    target = guidance.target_point(flash_bgr.shape, cover_mask, GUIDANCE_TARGET_MODE)
+    g = _GUIDANCE_TRACKER.update(center, flash_bgr.shape, target, conf, source)
+    _GUIDANCE_PRIOR = center if center is not None else _GUIDANCE_PRIOR
+    print(f"GUIDANCE: {g.instruction}"
+          + (f"  (off={g.distance:.0f}px {source} conf={conf:.2f})" if center else ""))
+
+    vis = guidance.annotate(cv2.convertScaleAbs(flash_bgr, alpha=3.0), g, target, center)
+
+    # Show it in a cv2 window so the operator actually sees the guidance on the Pi.
+    # (PHOTO_PATH still gets it too, but the external xdg-open viewer usually does
+    # not auto-refresh.)  This window stays responsive because capture runs inside
+    # the streaming HighGUI loop; harmless to call from the command loop as well.
+    if CV2_AVAILABLE:
+        disp = vis
+        h0 = disp.shape[0]
+        if h0 > 720:                                   # scale tall captures to fit
+            s = 720.0 / h0
+            disp = cv2.resize(disp, (int(disp.shape[1] * s), 720))
+        cv2.imshow(GUIDANCE_WINDOW, disp)
+        cv2.waitKey(1)
+
+    return Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
 
 
 def _ship_calibration(bgr):
@@ -2146,12 +2388,42 @@ def calibrate_cover(picam2):
     _ship_calibration(bgr)
 
 
+def _set_cover_side(side):
+    """Set which image edge the LED cover sits on: "top" (left eye) / "bottom"
+    (right eye).  The two eyes differ by a 180° rig flip, so switching side adds
+    180° to LIVE_ROTATION; the cover mask follows (load_cover_mask) and the
+    detection geometry auto-detects the side, so everything stays consistent.
+    """
+    global COVER_SIDE, LIVE_ROTATION
+    side = "bottom" if str(side).lower().startswith("b") else "top"
+    if side != COVER_SIDE:
+        LIVE_ROTATION = (LIVE_ROTATION + 2) % 4
+        COVER_SIDE = side
+    return COVER_SIDE
+
+
+def _prompt_cover_orientation():
+    """Ask which edge the LED cover sits on before streaming (default top = left
+    eye).  Choosing the opposite side rotates the feed 180°.  A missing terminal
+    or blank input keeps the default.  Switch later live with `f` / `cover_side`.
+    """
+    try:
+        ans = input("LED cover at [t]op (left eye, default) or "
+                    "[b]ottom (right eye)? ").strip().lower()
+    except EOFError:
+        ans = ""
+    _set_cover_side("bottom" if ans.startswith("b") else "top")
+    print(f"Cover side: {COVER_SIDE}  (rotation {LIVE_ROTATION * 90}°).\n")
+
+
 def streaming_mode(picam2):
     """Live video feed.
 
     SPACE (hold) / r — flash LED (GPIO 17), hold / lock
     a               — toggle ambient LED (GPIO 27)
     p               — toggle live Orlosky pupil detection
+    t               — toggle PC image transfer (HTTP-POST to receiver.py)
+    f               — flip to the other eye (cover top<->bottom, 180°)
     c               — snap an LED-cover calibration (no eye), instant; ships the
                       current frame (LEDs left as-is) for the dev machine to build
     ←/→             — rotate the live feed
@@ -2160,14 +2432,15 @@ def streaming_mode(picam2):
     """
 
     global LIVE_ROTATION
+    global TRANSFER_ENABLED
 
     if not CV2_AVAILABLE:
         print("cv2 not available - cannot show live feed.")
         return
 
     print("\nStreaming mode ON")
-    print("SPACE=flash | r=lock | a=ambient | p=pupil-detect | c=calibrate-cover | "
-          "←/→=rotate | ENTER/e=capture | s=exit\n")
+    print("SPACE=flash | r=lock | a=ambient | p=pupil-detect | t=pc-transfer | "
+          "f=flip-eye | c=calibrate-cover | ←/→=rotate | ENTER/e=capture | s=exit\n")
 
     apply_camera_settings(picam2, FLASH_GAIN)
 
@@ -2277,6 +2550,18 @@ def streaming_mode(picam2):
                 print(f"Live pupil detection: "
                       f"{'ON' if swirski_live_on else 'OFF'}")
 
+            # t toggles PC image transfer (HTTP-POST captures to receiver.py)
+            elif key == ord('t'):
+                TRANSFER_ENABLED = not TRANSFER_ENABLED
+                print(f"PC image transfer: "
+                      f"{'ON' if TRANSFER_ENABLED else 'OFF'}")
+
+            # f flips to the other eye: cover top<->bottom (180°, mask follows)
+            elif key == ord('f'):
+                _set_cover_side("bottom" if COVER_SIDE == "top" else "top")
+                _overlay_cache = None          # orientation changed -> redetect
+                print(f"Cover side: {COVER_SIDE} (rotation {LIVE_ROTATION * 90}°)")
+
             # c snaps the current frame as an LED-cover calibration (no eye in
             # place) and ships it — instant, no confirm, LEDs left as locked/on.
             elif key == ord('c'):
@@ -2328,6 +2613,11 @@ def handle_parameter_command(cmd, picam2):
     global SWIRSKI_DEBUG
     global PI_DETECT
     global PI_BUILD_CALIB
+    global TRANSFER_ENABLED
+    global PREVIEW_VIEWER
+    global USE_COVER_CALIB
+    global GUIDANCE_TARGET_MODE, GUIDANCE_USE_ML
+    global _GUIDANCE_TRACKER, _GUIDANCE_PRIOR
 
     parts = cmd.split()
 
@@ -2410,6 +2700,47 @@ def handle_parameter_command(cmd, picam2):
         elif param == "pi_build_calib":
             PI_BUILD_CALIB = bool(int(value))
 
+        # PC image transfer (HTTP-POST capture triples to receiver.py)
+        elif param == "transfer":
+            TRANSFER_ENABLED = bool(int(value))
+
+        # External retina_preview.jpg viewer (xdg-open); off by default
+        elif param == "preview":
+            PREVIEW_VIEWER = bool(int(value))
+            if PREVIEW_VIEWER:
+                os.system(f"xdg-open '{PHOTO_PATH}' >/dev/null 2>&1 &")
+                print("Preview viewer opened.")
+            else:
+                print("Preview viewer off (any open window stays).")
+
+        # Cover side / eye: "top" (left eye) | "bottom" (right eye); flips 180°
+        elif param == "cover_side":
+            if value.lower()[:1] in ("t", "b"):
+                _set_cover_side(value)
+                print(f"Cover side: {COVER_SIDE} (rotation {LIVE_ROTATION * 90}°).")
+            else:
+                print("cover_side must be 'top' or 'bottom'.")
+                return
+
+        # Cover masking + alignment guidance
+        elif param == "use_cover":
+            USE_COVER_CALIB = bool(int(value))
+
+        elif param == "guide_ml":
+            GUIDANCE_USE_ML = bool(int(value))
+
+        elif param == "guide_reset":          # start a new alignment session
+            _GUIDANCE_TRACKER = None
+            _GUIDANCE_PRIOR = None
+            print("Guidance session reset.")
+
+        elif param == "target_mode":          # "centre" | "cover_top_mid"
+            if value in ("centre", "cover_top_mid"):
+                GUIDANCE_TARGET_MODE = value
+            else:
+                print("target_mode must be 'centre' or 'cover_top_mid'.")
+                return
+
         else:
             print("Unknown parameter.")
             return
@@ -2427,6 +2758,12 @@ def main():
     print("\n╔══════════════════════════════════════╗")
     print("║   Retina Flash Photography           ║")
     print("╚══════════════════════════════════════╝")
+
+    # Check ML availability at boot
+    if RITNET_AVAILABLE:
+        print("✓ RITnet ML pupil detection available")
+    else:
+        print("✗ RITnet ML pupil detection NOT available")
 
     setup_gpio()
 
@@ -2454,26 +2791,31 @@ def main():
 
     time.sleep(2)
 
-    # ───────── PREOPEN IMAGE VIEWER ─────────
+    # ───────── PREOPEN IMAGE VIEWER (off by default) ─────────
+    # The alignment-guidance cv2 window is the live view now; the external
+    # retina_preview.jpg viewer is only opened when PREVIEW_VIEWER is on.
+    if PREVIEW_VIEWER:
+        blank = Image.new(
+            "RGB",
+            (CAMERA_WIDTH, CAMERA_HEIGHT),
+            (0, 0, 0)
+        )
 
-    blank = Image.new(
-        "RGB",
-        (CAMERA_WIDTH, CAMERA_HEIGHT),
-        (0, 0, 0)
-    )
+        blank.save(PHOTO_PATH)
 
-    blank.save(PHOTO_PATH)
+        os.system(
+            f"xdg-open '{PHOTO_PATH}' >/dev/null 2>&1 &"
+        )
 
-    os.system(
-        f"xdg-open '{PHOTO_PATH}' >/dev/null 2>&1 &"
-    )
+        print("\nViewer opened.")
+        print("Many viewers auto-refresh.\n")
 
-    print("\nViewer opened.")
-    print("Many viewers auto-refresh.\n")
-
-    time.sleep(5)
+        time.sleep(5)
 
     print_settings()
+
+    # Which eye / cover side are we starting on? (top = left eye, default.)
+    _prompt_cover_orientation()
 
     # ───────── BOOT STRAIGHT INTO STREAMING MODE ─────────
     # The program always starts streaming; exiting streaming (s) drops into the

@@ -1,0 +1,12 @@
+# Optional ML extras — only needed for the pre-trained RITnet segmentation module
+# (pupillab/modules/ritnet_seg.py).  The rest of the harness runs without these;
+# the RITnet module degrades to a friendly "install torch + weights" message when
+# torch is missing, so install this only when you want to run RITnet.
+#
+#   pip install -r requirements-ml.txt
+#
+# Windows / CPU note: the default PyPI wheels below are CPU-only and are all you
+# need on this dev machine.  For a CUDA build instead, follow the selector at
+# https://pytorch.org/get-started/locally/ .
+torch
+torchvision

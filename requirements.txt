@@ -1,0 +1,15 @@
+# EyeVu dev / pupil-detection harness — core dependencies.
+# Install into the `vision_env` conda environment (see setup_dev.ps1).
+#
+#   pip install -r requirements.txt
+#
+# These are everything the offline harness, the pupillab registry, the Streamlit
+# dashboard, and the classical detector modules need.  The pre-trained RITnet ML
+# module has heavier extra deps — see requirements-ml.txt.
+numpy
+opencv-python
+pillow
+scipy
+scikit-image
+matplotlib
+streamlit
