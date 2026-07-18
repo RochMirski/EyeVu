@@ -53,7 +53,7 @@ CALIB_IMAGE_NAME = "led_cover_calib.jpg"   # the raw calibration frame the Pi sh
 # (ridge + red-eye + RITnet — RITnet runs fine here on the PC) and tell the
 # operator which way to move the device.  One tracker, updated in arrival order,
 # gives relative phrasing across the session ("keep going" / "almost there").
-GUIDANCE_TARGET_MODE = "centre"        # "centre" now; "cover_top_mid" later
+GUIDANCE_TARGET_MODE = "cover_top_mid" # drive the pupil to the LED-cover inner edge
 _GUIDANCE = None
 _GUIDANCE_PRIOR = None
 _PROCESSED = set()
@@ -70,7 +70,8 @@ _INDEX_FIELDS = [
     "ridge_x", "ridge_y", "ridge_conf", "ridge_source",
     "ritnet_x", "ritnet_y", "ritnet_conf",
     "agree_dist", "chosen_source", "chosen_x", "chosen_y",
-    "off_px", "state", "instruction", "target_x", "target_y", "live_rotation",
+    "off_px", "state", "instruction", "target_x", "target_y",
+    "in_valid", "reached_valid", "endpoint", "live_rotation",
 ]
 
 
@@ -120,6 +121,7 @@ def _run_guidance(folder, dest_dir):
     import cap
     import guidance
     cv2 = cap.cv2
+    cap.RITNET_ALWAYS = True            # PC: always run RITnet so sorting has both detectors
     if _GUIDANCE is None:
         _GUIDANCE = guidance.GuidanceTracker()
 
@@ -157,8 +159,12 @@ def _run_guidance(folder, dest_dir):
 
     rs = f"{ridge[2]:.2f}" if ridge else "-"
     ns = f"{ritnet[2]:.2f}" if ritnet else "-"
+    verify = ("  >>> ENDPOINT: aligned or blocked (was at cover edge, now lost)"
+              if g.endpoint else "  [in valid region]" if g.in_valid_region
+              else "  [reached valid region earlier]" if g.reached_valid else "")
     print(f"  >>> GUIDANCE [{folder}]: {g.instruction}"
-          + (f"  (off={g.distance:.0f}px {source} conf={conf:.2f})" if center else ""))
+          + (f"  (off={g.distance:.0f}px {source} conf={conf:.2f})" if center else "")
+          + verify)
     print(f"  >>> CATEGORY [{folder}]: {category}  (ridge conf={rs}, ritnet conf={ns})")
     vis = guidance.annotate(cv2.convertScaleAbs(fla_bgr, alpha=3.0), g, target, center)
     cv2.imwrite(os.path.join(dest_dir, "guidance.jpg"), vis)
@@ -184,6 +190,8 @@ def _run_guidance(folder, dest_dir):
         "off_px": round(g.distance, 1) if center else "",
         "state": g.state, "instruction": g.instruction,
         "target_x": target[0], "target_y": target[1],
+        "in_valid": int(g.in_valid_region), "reached_valid": int(g.reached_valid),
+        "endpoint": int(g.endpoint),
         "live_rotation": cap.LIVE_ROTATION,
     })
     return category

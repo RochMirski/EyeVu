@@ -1,0 +1,24 @@
+folder,category,ridge_x,ridge_y,ridge_conf,ridge_source,ritnet_x,ritnet_y,ritnet_conf,agree_dist,chosen_source,chosen_x,chosen_y,off_px,state,instruction,target_x,target_y,live_rotation
+capture_20260716_195747,ridge_only,466.8,505.7,0.375,ambient,,,,,ambient,466.8,505.7,135.0,move,Move up,480,640,1
+capture_20260716_202325,ridge_only,553.0,975.2,0.292,ambient,,,,,ambient,553.0,975.2,343.1,move,"Move down and right a lot - wrong way, reverse",480,640,1
+capture_20260716_202447,ridge_only,625.5,143.9,0.302,ambient,,,,,ambient,625.5,143.9,517.0,move,"Move up and right a lot - wrong way, reverse",480,640,1
+capture_20260716_202522,ridge_only,293.9,451.2,0.635,ambient,,,,,ambient,293.9,451.2,265.1,move,Move up and left - keep going,480,640,1
+capture_20260716_202624,ridge_only,246.1,520.3,0.438,ambient,,,,,ambient,246.1,520.3,262.7,move,Move up and left,480,640,1
+capture_20260716_202703,ridge_only,136.2,156.0,0.375,ambient,,,,,ambient,136.2,156.0,593.7,move,"Move up and left a lot - wrong way, reverse",480,640,1
+capture_20260716_202803,ridge_only,288.2,258.5,0.375,ambient,,,,,ambient,288.2,258.5,427.0,move,Move up and left a lot - keep going,480,640,1
+capture_20260718_160354,ridge_only,400.5,600.8,0.448,ambient,,,,,ambient,400.5,600.8,88.6,move,Move up and left a little,480,640,1
+capture_20260718_160412,ritnet_only,372.0,606.0,0.66,redeye,436.8,526.3,0.958,102.7,ritnet,436.8,526.3,121.6,move,"Move up and left - wrong way, reverse",480,640,1
+capture_20260718_160517,ridge_only,138.7,605.4,0.333,ambient,,,,,ambient,138.7,605.4,343.0,move,"Move up and left a lot - wrong way, reverse",480,640,1
+capture_20260718_160659,ridge_only,447.0,644.0,0.651,redeye,,,,,redeye,447.0,644.0,33.2,centred,Centred - hold steady.,480,640,1
+capture_20260718_161012,ridge_only,379.0,478.0,0.717,redeye,,,,,redeye,379.0,478.0,190.9,move,"Move up and left - wrong way, reverse",480,640,1
+capture_20260718_161100,both,370.6,415.5,0.5,ambient,403.3,419.8,0.926,33.0,ritnet,403.3,419.8,233.2,move,"Move up and left - wrong way, reverse",480,640,1
+capture_20260718_161102,both,475.3,419.8,0.677,ambient,443.6,423.6,0.985,31.9,ritnet,443.6,423.6,219.4,move,Move up and left,480,640,1
+capture_20260718_162438,ridge_only,435.0,620.0,0.528,redeye,,,,,redeye,435.0,620.0,49.2,centred,Centred - hold steady.,480,640,3
+capture_20260718_172338,ridge_only,443.0,643.0,0.539,redeye,,,,,redeye,443.0,643.0,37.1,centred,Centred - hold steady.,480,640,3
+capture_20260718_180443,ridge_only,324.0,849.0,0.999,redeye,628.6,697.3,0.957,340.2,redeye,324.0,849.0,260.8,move,"Move down and left - wrong way, reverse",480,640,3
+capture_20260718_180624,no_pupil,,,,,,,,,,,,,searching,Searching for pupil - reposition the device.,480,640,3
+capture_20260718_180802,ridge_only,466.3,820.5,0.385,ambient,,,,,ambient,466.3,820.5,181.1,move,Move down - keep going,480,640,3
+capture_20260718_181204,ritnet_only,,,,,497.3,739.3,0.959,,ritnet,497.3,739.3,100.8,move,Move down - almost there,480,640,3
+capture_20260718_181258,both,667.0,771.6,0.417,ambient,604.6,803.2,0.952,69.9,ritnet,604.6,803.2,205.3,move,"Move down and right - wrong way, reverse",480,640,3
+capture_20260718_181446,ridge_only,550.4,748.7,0.448,ambient,,,,,ambient,550.4,748.7,129.5,move,Move down and right - keep going,480,640,3
+capture_20260718_181926,ritnet_only,,,,,802.0,736.7,0.966,,ritnet,802.0,736.7,336.3,move,"Move down and right a lot - wrong way, reverse",480,640,3

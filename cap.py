@@ -19,10 +19,11 @@ Streaming mode
 ──────────────
 SPACE (hold)        Flash LED (GPIO 17) on
 r                   Toggle flash LED lock on/off
-a                   Toggle ambient LED (GPIO 27) on/off
+a                   Toggle ambient LED (GPIO 22/27/23/6/26/16) on/off
 p                   Toggle live Orlosky pupil detection
 t                   Toggle PC image transfer (HTTP-POST to receiver.py)
 f                   Flip to the other eye (cover top<->bottom, 180°)
+m                   Toggle RITnet: every capture <-> only when ridge weak
 ←/→                 Rotate live feed
 ENTER or e          Capture still
 s                   Exit streaming
@@ -85,19 +86,29 @@ except ImportError:
     CV2_AVAILABLE = False
     print("Warning: cv2 not available.")
 
-try:
-    print("Checking RITnet availability...")
-    import ritnet_infer
-    RITNET_AVAILABLE = ritnet_infer.available()
-except Exception as e:
-    RITNET_AVAILABLE = False
-    ritnet_infer = None
-    print(f"Warning: ritnet_infer not available ({e}).")
+# ML pupil-segmentation backend.  Prefer torch RITnet (PC / aarch64); fall back to
+# ncnn RITnet on boards where torch has no build (ARMv6, e.g. a Pi Zero W).  Both
+# expose the same API: available(), locate(...), tangent_crop_center, RitnetResult.
+_ML_BACKEND = None
+ML_BACKEND_NAME = "none"
+for _bk_name, _bk_label in (("ritnet_infer", "torch RITnet"),
+                            ("ncnn_infer", "ncnn RITnet")):
+    try:
+        print(f"Checking {_bk_label} availability...")
+        _bk = __import__(_bk_name)
+        if _bk.available():
+            _ML_BACKEND = _bk
+            ML_BACKEND_NAME = _bk_label
+            break
+    except Exception as e:                       # noqa: BLE001
+        print(f"  {_bk_name} not available ({e}).")
+RITNET_AVAILABLE = _ML_BACKEND is not None
 
 # ───────── CONFIG ─────────
 
 LED_PIN   = 17     # flash LED   — retina retroreflection capture
-LED_PIN_2 = 27     # ambient LED — diffuse light for pupil detection
+# Ambient light = six LEDs driven together (diffuse light for pupil detection).
+AMBIENT_PINS = [22, 27, 23, 6, 26, 16]
 
 PHOTO_PATH   = "/tmp/retina_preview.jpg"   # annotated flash photo
 AMBIENT_PATH = "/tmp/retina_ambient.jpg"   # raw ambient image (Swirski input)
@@ -169,18 +180,24 @@ _PIL_ROTATIONS = [0, 90, 180, 270]
 
 def setup_gpio():
 
+    global GPIO_AVAILABLE
     if not GPIO_AVAILABLE:
         return
 
-    GPIO.setmode(GPIO.BCM)
-
-    GPIO.setwarnings(False)
-
-    GPIO.setup(LED_PIN,  GPIO.OUT)
-    GPIO.setup(LED_PIN_2, GPIO.OUT)
-
-    GPIO.output(LED_PIN,  GPIO.LOW)
-    GPIO.output(LED_PIN_2, GPIO.LOW)
+    try:
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        # Pass initial= so the rpi-lgpio backend (Raspberry Pi OS Bookworm/Trixie)
+        # does NOT gpio_read to preserve the pin state on setup — that read raises
+        # lgpio "GPIO not allocated" and used to crash the whole program at boot
+        # (before streaming), which looked like "streaming immediately closes".
+        GPIO.setup(LED_PIN, GPIO.OUT, initial=GPIO.LOW)
+        for _p in AMBIENT_PINS:
+            GPIO.setup(_p, GPIO.OUT, initial=GPIO.LOW)
+    except Exception as e:                       # noqa: BLE001 — never block streaming on GPIO
+        GPIO_AVAILABLE = False
+        print(f"Warning: GPIO setup failed ({e}); LEDs disabled, "
+              "camera/streaming still work.")
 
 
 def cleanup_gpio():
@@ -188,8 +205,9 @@ def cleanup_gpio():
     if not GPIO_AVAILABLE:
         return
 
-    GPIO.output(LED_PIN,  GPIO.LOW)
-    GPIO.output(LED_PIN_2, GPIO.LOW)
+    GPIO.output(LED_PIN, GPIO.LOW)
+    for _p in AMBIENT_PINS:
+        GPIO.output(_p, GPIO.LOW)
 
     GPIO.cleanup()
 
@@ -207,15 +225,17 @@ def flash_off():
 
 
 def ambient_on():
-    """Turn on the GPIO 27 ambient LED (diffuse light for pupil detection)."""
+    """Turn on the ambient LEDs (GPIO 22/27/23/6/26/16; diffuse light for pupil detection)."""
     if GPIO_AVAILABLE:
-        GPIO.output(LED_PIN_2, GPIO.HIGH)
+        for _p in AMBIENT_PINS:
+            GPIO.output(_p, GPIO.HIGH)
 
 
 def ambient_off():
-    """Turn off the GPIO 27 ambient LED."""
+    """Turn off the ambient LEDs (GPIO 22/27/23/6/26/16)."""
     if GPIO_AVAILABLE:
-        GPIO.output(LED_PIN_2, GPIO.LOW)
+        for _p in AMBIENT_PINS:
+            GPIO.output(_p, GPIO.LOW)
 
 
 def apply_camera_settings(picam2, gain):
@@ -272,6 +292,7 @@ def print_settings():
     print(f"pi_detect          = {'ON' if PI_DETECT else 'OFF'}")
     print(f"use_cover          = {'ON' if USE_COVER_CALIB else 'OFF'}")
     print(f"cover_side         = {COVER_SIDE}  (rotation {LIVE_ROTATION * 90}°)")
+    print(f"ritnet             = {'every capture' if RITNET_ALWAYS else f'when ridge<{RITNET_CONF_GATE:.2f}'}")
 
     print("────────────────────────\n")
 
@@ -458,9 +479,18 @@ _LAST_CONF = 0.0
 # is the last pupil centre (display orientation) that seeds the next search.
 _GUIDANCE_TRACKER = None
 _GUIDANCE_PRIOR = None
-GUIDANCE_TARGET_MODE = "centre"        # "centre" now; "cover_top_mid" later
+GUIDANCE_TARGET_MODE = "cover_top_mid" # drive the pupil to the LED-cover inner edge
+                                       # ("centre" = image centre; toggle: target_mode)
 GUIDANCE_USE_ML = True                 # let coarse_locate try RITnet (if present)
 GUIDANCE_WINDOW = "Alignment Guidance" # Pi cv2 window the annotated capture is shown in
+
+# RITnet is slow on the Pi (ncnn on ARMv6 ~ minutes/frame), so by default it runs
+# only when the cheap ridge/red-eye cue is weak (missing or below RITNET_CONF_GATE)
+# — the "two-tier" approach.  Flip RITNET_ALWAYS (command `ritnet_always 1` / key
+# `m`) to run it on every capture.  The PC receiver sets RITNET_ALWAYS=True so its
+# capture sorting always has both detectors.
+RITNET_ALWAYS = False
+RITNET_CONF_GATE = 0.35                 # run RITnet when ridge confidence < this
 
 
 def _dbg(name, img):
@@ -2061,33 +2091,35 @@ def detect_both(ambient_bgr, flash_bgr, cover_mask=None, prior=None, allow_ml=Tr
 
     # ── RITnet (optional; only where torch + weights are available) ──
     ritnet = None
-    if allow_ml and RITNET_AVAILABLE:
-        """try:
-            import ritnet_infer
-        except Exception as e:                 # noqa: BLE001  (module not deployed)
-            print(f"Error loading ritnet_infer: {e}")
-            ritnet_infer = None"""
-        if ritnet_infer is not None and ritnet_infer.available():
-            green = ambient_bgr[:, :, 1]
-            if cover_mask is not None and int(cv2.countNonZero(cover_mask)):
-                green = cv2.inpaint(green, cover_mask, 15, cv2.INPAINT_TELEA)
-            reflex = _find_corneal_reflex(green)
-            reflex_mask = reflex[3] if reflex is not None else None
-            ranch = (reflex[0], reflex[1]) if reflex is not None else anchor
-            # Crop centre: prior (tracking) -> tangent past the cover (initial)
-            # -> the ridge centre -> the reflex anchor.
-            if prior is not None:
-                cc = prior
-            elif cover_mask is not None and int(cv2.countNonZero(cover_mask)):
-                cc = ritnet_infer.tangent_crop_center(cover_mask, (h, w))
-            elif ridge is not None:
-                cc = ridge[0]
-            else:
-                cc = ranch
-            rr = ritnet_infer.locate(green, reflex_mask=reflex_mask, anchor=ranch,
-                                     crop_center=cc)
-            if rr.ok and rr.center is not None:
-                ritnet = (rr.center, rr.radius, float(rr.confidence), "ritnet")
+    # Two-tier gate: run the (slow on Pi) ML rung only when the cheap ridge cue is
+    # weak, unless RITNET_ALWAYS forces it on every capture.
+    run_ml = allow_ml and _ML_BACKEND is not None
+    if run_ml and not RITNET_ALWAYS:
+        ridge_conf = ridge[2] if ridge is not None else 0.0
+        run_ml = ridge_conf < RITNET_CONF_GATE
+    if run_ml:
+        ml = _ML_BACKEND                          # torch RITnet (PC) or ncnn (Pi)
+        if ML_BACKEND_NAME == "ncnn RITnet":      # slow path — tell the operator
+            print("  RITnet (ncnn) running - slow on the Pi, hold steady...")
+        green = ambient_bgr[:, :, 1]
+        if cover_mask is not None and int(cv2.countNonZero(cover_mask)):
+            green = cv2.inpaint(green, cover_mask, 15, cv2.INPAINT_TELEA)
+        reflex = _find_corneal_reflex(green)
+        reflex_mask = reflex[3] if reflex is not None else None
+        ranch = (reflex[0], reflex[1]) if reflex is not None else anchor
+        # Crop centre: prior (tracking) -> tangent past the cover (initial)
+        # -> the ridge centre -> the reflex anchor.
+        if prior is not None:
+            cc = prior
+        elif cover_mask is not None and int(cv2.countNonZero(cover_mask)):
+            cc = ml.tangent_crop_center(cover_mask, (h, w))
+        elif ridge is not None:
+            cc = ridge[0]
+        else:
+            cc = ranch
+        rr = ml.locate(green, reflex_mask=reflex_mask, anchor=ranch, crop_center=cc)
+        if rr.ok and rr.center is not None:
+            ritnet = (rr.center, rr.radius, float(rr.confidence), "ritnet")
     return ridge, ritnet
 
 
@@ -2155,14 +2187,17 @@ def upload_calibration_image(bgr):
     return False
 
 
-def transfer_capture(ambient_array, flash_array, both_array=None):
+def transfer_capture(ambient_array, flash_array, both_array=None, detect_bgr=None):
     """Stage the raw capture frames locally and POST them to the dev machine.
 
     Writes LOCAL_STAGING_DIR/capture_<timestamp>/{ambient.jpg, flash.jpg,
-    both.jpg, meta.json}, then uploads each via HTTP POST to receiver.py.
-    `both.jpg` (flash+ambient) is included when captured.  The raw images are
-    saved (no overlay) so the test harness can re-run detection cleanly;
-    meta.json records LIVE_ROTATION so the test rotates exactly as the Pi did.
+    both.jpg, detect.jpg, meta.json}, then uploads each via HTTP POST to
+    receiver.py.  `both.jpg` (flash+ambient) is included when captured;
+    `detect.jpg` (BGR) is the Pi-side overlay of what BOTH detectors found +
+    the guidance, included when PI_DETECT produced one.  The raw images are saved
+    (no overlay) so the harness can re-run detection cleanly; meta.json records
+    LIVE_ROTATION.  meta.json is uploaded LAST so the receiver only triggers once
+    the whole folder (incl. detect.jpg) has arrived.
 
     Any failure is reported on the Pi but never raised — a transfer problem
     must not interrupt capture or streaming.
@@ -2172,7 +2207,7 @@ def transfer_capture(ambient_array, flash_array, both_array=None):
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     folder = os.path.join(LOCAL_STAGING_DIR, f"capture_{stamp}")
-    fnames = ["ambient.jpg", "flash.jpg", "meta.json"]
+    fnames = ["ambient.jpg", "flash.jpg"]
 
     # ── stage the frames locally ──
     try:
@@ -2181,7 +2216,10 @@ def transfer_capture(ambient_array, flash_array, both_array=None):
         Image.fromarray(flash_array).save(os.path.join(folder, "flash.jpg"))
         if both_array is not None:
             Image.fromarray(both_array).save(os.path.join(folder, "both.jpg"))
-            fnames.insert(2, "both.jpg")
+            fnames.append("both.jpg")
+        if detect_bgr is not None and CV2_AVAILABLE:
+            cv2.imwrite(os.path.join(folder, "detect.jpg"), detect_bgr)
+            fnames.append("detect.jpg")
         meta = {
             "timestamp":     stamp,
             "live_rotation": LIVE_ROTATION,
@@ -2196,6 +2234,7 @@ def transfer_capture(ambient_array, flash_array, both_array=None):
         }
         with open(os.path.join(folder, "meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
+        fnames.append("meta.json")             # uploaded last -> receiver trigger
     except OSError as e:
         print(f"[TRANSFER ERROR] could not stage capture: {e}")
         return
@@ -2268,7 +2307,7 @@ def capture_image(picam2):
     _drain_frames(picam2)              # flush frames exposed before ambient on
     both_array = picam2.capture_array()
 
-    # ── 3) AMBIENT ONLY (GPIO 27) ──
+    # ── 3) AMBIENT ONLY (GPIO 22/27/23/6/26/16) ──
     flash_off()
     time.sleep(FLASH_PRE_DELAY)
     _drain_frames(picam2)              # flush frames exposed before flash off
@@ -2281,28 +2320,62 @@ def capture_image(picam2):
     # Save the raw ambient image for inspection
     Image.fromarray(ambient_array).save(AMBIENT_PATH)
 
-    # ───────── IMAGE TRANSFER ─────────
-    # Push the raw triple to the dev machine for offline detection testing.
-    transfer_capture(ambient_array, flash_array, both_array)
-
     # ───────── PUPIL DETECTION + ALIGNMENT GUIDANCE ─────────
     # Off by default (PI_DETECT): the Pi just captures + transfers, and the dev
     # machine (receiver.py) runs detection + guidance on the received triple.
-    # When PI_DETECT is on, run the coarse-locate cascade here (capture time only,
-    # never in live preview) and tell the operator which way to move the device.
+    # When PI_DETECT is on, run detection here (capture time only, never in live
+    # preview): overlay what BOTH detectors found + the guidance into detect.jpg,
+    # which is transferred alongside the raw triple.  Wrapped so a detection error
+    # never aborts the capture/transfer or drops out of streaming.
+    detect_bgr = None
+    img = None
     if PI_DETECT and CV2_AVAILABLE:
-        img = _guide_capture(ambient_array, flash_array)
-    else:
+        try:
+            detect_bgr = _guide_capture(ambient_array, flash_array)   # BGR overlay
+            img = Image.fromarray(cv2.cvtColor(detect_bgr, cv2.COLOR_BGR2RGB))
+        except Exception as e:                     # noqa: BLE001
+            import traceback
+            print(f"[DETECT ERROR] {e!r}")
+            traceback.print_exc()
+    if img is None:
         img = process_image(flash_array, [])
 
-    # Save the annotated flash photo
+    # ───────── IMAGE TRANSFER ─────────
+    # Push the raw triple (+ detect.jpg) to the dev machine.
+    transfer_capture(ambient_array, flash_array, both_array, detect_bgr)
+
+    # Save the annotated flash photo locally
     img.save(PHOTO_PATH)
 
     print("Captured.")
 
 
+def _draw_detections(vis, ridge, ritnet, category):
+    """Overlay BOTH detectors on the guidance image: ridge (traditional) in cyan,
+    RITnet (NN) in magenta, plus a legend with the category."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    h = vis.shape[0]
+    if ridge is not None:
+        (rx, ry), rr = ridge[0], ridge[1]
+        cv2.circle(vis, (int(rx), int(ry)), max(3, int(rr)), (255, 255, 0), 2)  # cyan
+        cv2.putText(vis, f"ridge {ridge[2]:.2f}",
+                    (int(rx) - 36, int(ry) - max(3, int(rr)) - 6),
+                    font, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
+    if ritnet is not None:
+        (nx, ny), nr = ritnet[0], (ritnet[1] or 8)
+        cv2.circle(vis, (int(nx), int(ny)), max(3, int(nr)), (255, 0, 255), 2)  # magenta
+        cv2.putText(vis, f"nn {ritnet[2]:.2f}",
+                    (int(nx) - 24, int(ny) + max(3, int(nr)) + 16),
+                    font, 0.5, (255, 0, 255), 1, cv2.LINE_AA)
+    legend = f"[{category}]  cyan=ridge  magenta=nn"
+    cv2.putText(vis, legend, (10, h - 12), font, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(vis, legend, (10, h - 12), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    return vis
+
+
 def _guide_capture(ambient_array, flash_array):
-    """Run coarse_locate + alignment guidance on one capture; return annotated PIL.
+    """Run BOTH detectors + alignment guidance on one capture; return the BGR
+    overlay (what ridge AND RITnet found, plus the guidance target/arrow/text).
 
     Stateful across captures (module-level tracker + prior) so the instruction can
     refine relative to the previous move ("keep going" / "almost there").
@@ -2320,34 +2393,43 @@ def _guide_capture(ambient_array, flash_array):
         flash_bgr = cv2.rotate(flash_bgr, rot)
 
     cover_mask = load_cover_mask(amb_bgr.shape[:2])
-    res = coarse_locate(amb_bgr, flash_bgr, cover_mask, _GUIDANCE_PRIOR,
-                        allow_ml=GUIDANCE_USE_ML)
-    center = res[0] if res else None
-    conf = res[2] if res else 0.0
-    source = res[3] if res else ""
+    # Run the traditional (ridge/red-eye) and NN (RITnet) detectors separately so
+    # we can show both; the gated cascade decides which drives the guidance.
+    ridge, ritnet = detect_both(amb_bgr, flash_bgr, cover_mask, _GUIDANCE_PRIOR,
+                                allow_ml=GUIDANCE_USE_ML)
+    category, chosen = classify_detection(ridge, ritnet, amb_bgr.shape)
+    center = chosen[0] if chosen else None
+    conf = chosen[2] if chosen else 0.0
+    source = chosen[3] if chosen else ""
 
     target = guidance.target_point(flash_bgr.shape, cover_mask, GUIDANCE_TARGET_MODE)
     g = _GUIDANCE_TRACKER.update(center, flash_bgr.shape, target, conf, source)
     _GUIDANCE_PRIOR = center if center is not None else _GUIDANCE_PRIOR
-    print(f"GUIDANCE: {g.instruction}"
-          + (f"  (off={g.distance:.0f}px {source} conf={conf:.2f})" if center else ""))
+    rs = f"{ridge[2]:.2f}" if ridge else "-"
+    ns = f"{ritnet[2]:.2f}" if ritnet else "-"
+    verify = ("  >>> ENDPOINT: pupil was at the cover edge then lost - ALIGNED or "
+              "BLOCKED (check for fundus)" if g.endpoint
+              else "  [in valid region]" if g.in_valid_region
+              else "  [reached valid region earlier]" if g.reached_valid else "")
+    print(f"GUIDANCE [{category}]: {g.instruction}"
+          + (f"  off={g.distance:.0f}px {source} conf={conf:.2f}" if center else "")
+          + f"  (ridge {rs}, nn {ns}){verify}")
 
     vis = guidance.annotate(cv2.convertScaleAbs(flash_bgr, alpha=3.0), g, target, center)
+    _draw_detections(vis, ridge, ritnet, category)
 
-    # Show it in a cv2 window so the operator actually sees the guidance on the Pi.
-    # (PHOTO_PATH still gets it too, but the external xdg-open viewer usually does
-    # not auto-refresh.)  This window stays responsive because capture runs inside
-    # the streaming HighGUI loop; harmless to call from the command loop as well.
+    # Show it in a cv2 window so the operator sees it on the Pi (the xdg-open
+    # viewer usually does not auto-refresh).  Responsive inside the streaming loop.
     if CV2_AVAILABLE:
         disp = vis
         h0 = disp.shape[0]
-        if h0 > 720:                                   # scale tall captures to fit
+        if h0 > 720:
             s = 720.0 / h0
             disp = cv2.resize(disp, (int(disp.shape[1] * s), 720))
         cv2.imshow(GUIDANCE_WINDOW, disp)
         cv2.waitKey(1)
 
-    return Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+    return vis
 
 
 def _ship_calibration(bgr):
@@ -2420,10 +2502,12 @@ def streaming_mode(picam2):
     """Live video feed.
 
     SPACE (hold) / r — flash LED (GPIO 17), hold / lock
-    a               — toggle ambient LED (GPIO 27)
+    a               — toggle ambient LED (GPIO 22/27/23/6/26/16)
     p               — toggle live Orlosky pupil detection
+    g               — toggle the live guidance arrow (target + arrow + instruction)
     t               — toggle PC image transfer (HTTP-POST to receiver.py)
     f               — flip to the other eye (cover top<->bottom, 180°)
+    m               — toggle RITnet: every capture <-> only when ridge weak
     c               — snap an LED-cover calibration (no eye), instant; ships the
                       current frame (LEDs left as-is) for the dev machine to build
     ←/→             — rotate the live feed
@@ -2433,14 +2517,16 @@ def streaming_mode(picam2):
 
     global LIVE_ROTATION
     global TRANSFER_ENABLED
+    global RITNET_ALWAYS
 
     if not CV2_AVAILABLE:
         print("cv2 not available - cannot show live feed.")
         return
 
     print("\nStreaming mode ON")
-    print("SPACE=flash | r=lock | a=ambient | p=pupil-detect | t=pc-transfer | "
-          "f=flip-eye | c=calibrate-cover | ←/→=rotate | ENTER/e=capture | s=exit\n")
+    print("SPACE=flash | r=lock | a=ambient | p=pupil-detect | g=guide-arrow | "
+          "t=pc-transfer | f=flip-eye | m=ritnet-mode | c=calibrate-cover | "
+          "←/→=rotate | ENTER/e=capture | s=exit\n")
 
     apply_camera_settings(picam2, FLASH_GAIN)
 
@@ -2471,9 +2557,22 @@ def streaming_mode(picam2):
     led_on = False
     lock_on = False
     ambient_led_on = False
+    import guidance
     swirski_live_on = SWIRSKI_LIVE_DEFAULT
+    live_guide_on = False                  # 'g': draw the guidance arrow live
+    _live_guide = guidance.GuidanceTracker()
+    _live_center = None
     _detect_counter = 0
     _overlay_cache = None
+    exit_reason = "unknown"
+
+    # WND_PROP_VISIBLE is unsupported on some backends (this Pi's GTK build returns
+    # -1 even for a visible window), which made the close-on-X check exit streaming
+    # instantly.  Probe it now; only use the check when the backend reports a valid
+    # value (>= 0).  Otherwise rely on 's' / Ctrl-C to exit.
+    _win_close_check = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) >= 0
+    if not _win_close_check:
+        print("(window close-detection off: WND_PROP_VISIBLE unsupported on this backend)")
 
     try:
 
@@ -2490,15 +2589,27 @@ def streaming_mode(picam2):
             else:
                 disp = cv2.resize(frame, (DISPLAY_H, DISPLAY_W))
 
-            # Live Swirski pupil detection — recompute every N frames
-            if swirski_live_on:
+            # Live pupil detection (ridge) — recompute every N frames; runs when
+            # the pupil overlay (p) OR live guidance (g) is on.
+            if swirski_live_on or live_guide_on:
                 _detect_counter += 1
                 if (_overlay_cache is None
                         or _detect_counter % _LIVE_DETECT_SKIP == 0):
                     gray = cv2.cvtColor(disp, cv2.COLOR_BGR2GRAY)
                     _overlay_cache = detect_pupil(gray, live=True)
-                if _overlay_cache:
+                    _live_center = ((_LAST_PUPIL[0], _LAST_PUPIL[1])
+                                    if _LAST_PUPIL is not None else None)
+                if swirski_live_on and _overlay_cache:
                     disp = _draw_overlays(disp.copy(), _overlay_cache)
+                # Live guidance arrow: target the LED-cover edge, arrow from it to
+                # the pupil, plain-language instruction.  Everything in disp coords
+                # (cover mask resized to the display), so it lines up with the feed.
+                if live_guide_on:
+                    cover_disp = load_cover_mask(disp.shape[:2])
+                    tgt = guidance.target_point(disp.shape, cover_disp,
+                                                GUIDANCE_TARGET_MODE)
+                    lg = _live_guide.update(_live_center, disp.shape, tgt, 1.0, "live")
+                    disp = guidance.annotate(disp, lg, tgt, _live_center)
 
             cv2.imshow(WINDOW_NAME, disp)
 
@@ -2506,11 +2617,15 @@ def streaming_mode(picam2):
             now = time.time()
             space_held = (now - last_space_time <= SPACE_TIMEOUT)
 
-            # Also exit if the window is closed via the X button
-            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            # Also exit if the window is closed via the X button (only where the
+            # backend actually supports the visibility property).
+            if _win_close_check and \
+                    cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                exit_reason = "window closed (WND_PROP_VISIBLE < 1)"
                 break
 
             if key == ord('s'):
+                exit_reason = "'s' pressed"
                 break
 
             # Capture still: ENTER or e
@@ -2534,7 +2649,7 @@ def streaming_mode(picam2):
             elif key == ord('r'):
                 lock_on = not lock_on
 
-            # a toggles the ambient LED (GPIO 27)
+            # a toggles the ambient LED (GPIO 22/27/23/6/26/16)
             elif key == ord('a'):
                 ambient_led_on = not ambient_led_on
                 if ambient_led_on:
@@ -2550,6 +2665,13 @@ def streaming_mode(picam2):
                 print(f"Live pupil detection: "
                       f"{'ON' if swirski_live_on else 'OFF'}")
 
+            # g toggles the live guidance arrow (target + arrow + instruction)
+            elif key == ord('g'):
+                live_guide_on = not live_guide_on
+                _live_guide.reset()
+                _overlay_cache = None
+                print(f"Live guidance arrow: {'ON' if live_guide_on else 'OFF'}")
+
             # t toggles PC image transfer (HTTP-POST captures to receiver.py)
             elif key == ord('t'):
                 TRANSFER_ENABLED = not TRANSFER_ENABLED
@@ -2561,6 +2683,11 @@ def streaming_mode(picam2):
                 _set_cover_side("bottom" if COVER_SIDE == "top" else "top")
                 _overlay_cache = None          # orientation changed -> redetect
                 print(f"Cover side: {COVER_SIDE} (rotation {LIVE_ROTATION * 90}°)")
+
+            # m toggles RITnet: every capture <-> only when ridge is weak
+            elif key == ord('m'):
+                RITNET_ALWAYS = not RITNET_ALWAYS
+                print(f"RITnet: {'every capture' if RITNET_ALWAYS else 'only when ridge weak'}")
 
             # c snaps the current frame as an LED-cover calibration (no eye in
             # place) and ships it — instant, no confirm, LEDs left as locked/on.
@@ -2585,13 +2712,21 @@ def streaming_mode(picam2):
                 flash_off()
                 led_on = False
 
+    except Exception as e:                     # noqa: BLE001 — surface WHY streaming ended
+        import traceback
+        exit_reason = f"exception: {e!r}"
+        traceback.print_exc()
+
     finally:
 
         flash_off()
         ambient_off()
         apply_camera_settings(picam2, LIVE_GAIN)
-        cv2.destroyWindow(WINDOW_NAME)
-        print("Streaming mode OFF.\n")
+        try:
+            cv2.destroyWindow(WINDOW_NAME)
+        except Exception:                      # noqa: BLE001
+            pass
+        print(f"Streaming mode OFF - reason: {exit_reason}\n")
 
 
 def handle_parameter_command(cmd, picam2):
@@ -2617,6 +2752,7 @@ def handle_parameter_command(cmd, picam2):
     global PREVIEW_VIEWER
     global USE_COVER_CALIB
     global GUIDANCE_TARGET_MODE, GUIDANCE_USE_ML
+    global RITNET_ALWAYS, RITNET_CONF_GATE
     global _GUIDANCE_TRACKER, _GUIDANCE_PRIOR
 
     parts = cmd.split()
@@ -2729,6 +2865,13 @@ def handle_parameter_command(cmd, picam2):
         elif param == "guide_ml":
             GUIDANCE_USE_ML = bool(int(value))
 
+        # RITnet gating: run it every capture, or only when ridge is weak
+        elif param == "ritnet_always":
+            RITNET_ALWAYS = bool(int(value))
+
+        elif param == "ritnet_gate":          # ridge conf below which RITnet fires
+            RITNET_CONF_GATE = max(0.0, min(1.0, float(value)))
+
         elif param == "guide_reset":          # start a new alignment session
             _GUIDANCE_TRACKER = None
             _GUIDANCE_PRIOR = None
@@ -2761,9 +2904,9 @@ def main():
 
     # Check ML availability at boot
     if RITNET_AVAILABLE:
-        print("✓ RITnet ML pupil detection available")
+        print(f"✓ RITnet ML pupil detection available ({ML_BACKEND_NAME})")
     else:
-        print("✗ RITnet ML pupil detection NOT available")
+        print("✗ RITnet ML pupil detection NOT available (ridge + red-eye only)")
 
     setup_gpio()
 
@@ -2828,6 +2971,7 @@ def main():
             import termios
             termios.tcflush(sys.stdin, termios.TCIOFLUSH)
         except Exception:
+            print("Warning: could not flush stdin; stray keystrokes may appear in the command loop.")
             pass
 
         print("ENTER     = capture (ambient + flash, with pupil detection)")

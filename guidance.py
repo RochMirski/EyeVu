@@ -24,6 +24,10 @@ DEADZONE_FRAC = 0.06     # within this of the target => "centred"
 SMALL_FRAC = 0.10        # |offset| below this is "a little"
 LARGE_FRAC = 0.28        # |offset| above this is "a lot"
 IMPROVE_FRAC = 0.02      # min change in distance to call it better/worse
+VALID_FRAC = 0.12        # within this of the target (cover edge) => "valid region":
+                         # the pupil is at the alignment point.  Once it has been
+                         # seen here and is then lost, the eye is either aligned
+                         # (fundus filling the pupil) or the cover has moved over it.
 
 
 def target_point(frame_shape, cover_mask=None, mode="centre"):
@@ -54,12 +58,16 @@ def target_point(frame_shape, cover_mask=None, mode="centre"):
 
 @dataclass
 class Guidance:
-    state: str = "searching"          # "searching" | "move" | "centred"
+    state: str = "searching"          # "searching" | "move" | "centred" | "reached"
     instruction: str = "Searching for pupil..."
     vector: Optional[tuple] = None    # (dx, dy) = pupil - target, px
     distance: float = 0.0             # |vector|, px
     confidence: float = 0.0
     source: str = ""                  # which detector found the pupil
+    in_valid_region: bool = False     # pupil currently detected near the cover edge
+    reached_valid: bool = False       # pupil has EVER reached the valid region this session
+    endpoint: bool = False            # was in the valid region, now lost -> aligned OR
+                                      # blocked over (check for fundus / capture)
 
 
 def _axis_word(value, positive, negative, dead):
@@ -81,42 +89,60 @@ def _magnitude_word(dist, scale):
 class GuidanceTracker:
     """Stateful guidance across the captures of one alignment session."""
 
-    def __init__(self, deadzone_frac=DEADZONE_FRAC):
+    def __init__(self, deadzone_frac=DEADZONE_FRAC, valid_frac=VALID_FRAC):
         self.deadzone_frac = deadzone_frac
+        self.valid_frac = valid_frac
         self._last_dist = None
         self._last_vec = None
+        self._was_in_valid = False    # pupil has reached the valid region this session
 
     def reset(self):
         self._last_dist = None
         self._last_vec = None
+        self._was_in_valid = False
 
     def update(self, pupil_center, frame_shape, target, confidence=1.0,
                source="") -> Guidance:
         """Compute guidance for this capture and fold in the previous one.
 
         `pupil_center` is (x, y) or None.  `target` is (tx, ty).  Returns a
-        ``Guidance``; also stores state for the next call's relative phrasing.
+        ``Guidance``; also stores state for the next call's relative phrasing and
+        tracks whether the pupil has reached the valid region (near the cover
+        edge) so a subsequent loss can be reported as aligned/blocked.
         """
         h, w = frame_shape[:2]
         scale = float(min(h, w))
         dead = self.deadzone_frac * scale
+        valid = self.valid_frac * scale
 
         if pupil_center is None:
-            g = Guidance(state="searching",
-                         instruction="Searching for pupil - reposition the device.",
-                         confidence=confidence, source=source)
-            # keep last_* so a recovered track can still compare
-            return g
+            # Pupil lost.  If it had reached the valid region, losing it means the
+            # eye is either aligned (fundus filling the pupil) or the cover has
+            # moved over it -> endpoint reached.
+            if self._was_in_valid:
+                return Guidance(
+                    state="reached",
+                    instruction="Pupil reached the cover edge then lost - aligned or "
+                                "covered. Check for fundus / capture.",
+                    confidence=confidence, source=source,
+                    reached_valid=True, endpoint=True)
+            return Guidance(state="searching",
+                            instruction="Searching for pupil - reposition the device.",
+                            confidence=confidence, source=source)
 
         dx = float(pupil_center[0] - target[0])
         dy = float(pupil_center[1] - target[1])
         dist = float(np.hypot(dx, dy))
+        in_valid = dist <= valid
+        if in_valid:
+            self._was_in_valid = True
 
         if dist <= dead:
             self._last_dist, self._last_vec = dist, (dx, dy)
             return Guidance(state="centred", instruction="Centred - hold steady.",
                             vector=(dx, dy), distance=dist, confidence=confidence,
-                            source=source)
+                            source=source, in_valid_region=in_valid,
+                            reached_valid=self._was_in_valid)
 
         # Name a direction on each axis well before the centred deadzone, so an
         # off-centre pupil always gets an actionable "up/down/left/right".
@@ -139,7 +165,8 @@ class GuidanceTracker:
 
         self._last_dist, self._last_vec = dist, (dx, dy)
         return Guidance(state="move", instruction=instruction, vector=(dx, dy),
-                        distance=dist, confidence=confidence, source=source)
+                        distance=dist, confidence=confidence, source=source,
+                        in_valid_region=in_valid, reached_valid=self._was_in_valid)
 
 
 def annotate(frame_bgr, guidance: Guidance, target, pupil_center=None):
@@ -147,17 +174,24 @@ def annotate(frame_bgr, guidance: Guidance, target, pupil_center=None):
 
     Returns the annotated BGR image (a copy)."""
     img = frame_bgr.copy()
+    h, w = img.shape[:2]
     tx, ty = int(target[0]), int(target[1])
+    # Valid region (the alignment zone around the cover-edge target).
+    valid_r = int(VALID_FRAC * min(h, w))
+    cv2.circle(img, (tx, ty), valid_r, (0, 200, 200), 1, cv2.LINE_AA)
     # Target crosshair (cyan).
     cv2.drawMarker(img, (tx, ty), (255, 255, 0), cv2.MARKER_CROSS, 24, 2)
     cv2.circle(img, (tx, ty), 6, (255, 255, 0), 1)
 
     colour = {"centred": (0, 255, 0), "move": (0, 165, 255),
-              "searching": (0, 0, 255)}.get(guidance.state, (0, 165, 255))
+              "searching": (0, 0, 255), "reached": (0, 255, 0)}.get(
+                  guidance.state, (0, 165, 255))
 
     if pupil_center is not None:
         px, py = int(pupil_center[0]), int(pupil_center[1])
-        cv2.circle(img, (px, py), 5, colour, -1)
+        # Fill the pupil dot green when it's inside the valid region.
+        dot = (0, 255, 0) if guidance.in_valid_region else colour
+        cv2.circle(img, (px, py), 5, dot, -1)
         if guidance.state == "move":
             cv2.arrowedLine(img, (tx, ty), (px, py), colour, 2, tipLength=0.2)
 
@@ -170,6 +204,12 @@ def annotate(frame_bgr, guidance: Guidance, target, pupil_center=None):
         sub += f" {guidance.source}"
     if guidance.distance:
         sub += f"  off={guidance.distance:.0f}px"
+    if guidance.in_valid_region:
+        sub += "  IN-VALID"
+    elif guidance.reached_valid:
+        sub += "  was-valid"
+    if guidance.endpoint:
+        sub += "  ENDPOINT: aligned/blocked"
     cv2.putText(img, sub, (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (200, 200, 200), 1, cv2.LINE_AA)
     return img

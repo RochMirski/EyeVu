@@ -73,6 +73,31 @@ def test_searching_when_no_pupil():
     assert g.state == "searching", g.state
 
 
+def test_in_valid_region():
+    # frame 1000x600 -> scale 600, dead=36px, valid=72px.  Pupil 50px from target:
+    t = guidance.GuidanceTracker()
+    g = t.update((350, 500), (1000, 600), (300, 500))
+    assert g.state == "move", g.state              # 50 > dead(36)
+    assert g.in_valid_region, "50px < valid(72) should be in the valid region"
+
+
+def test_endpoint_after_valid():
+    # pupil reaches the valid region, then is lost -> aligned/blocked endpoint.
+    t = guidance.GuidanceTracker()
+    t.update((350, 500), (1000, 600), (300, 500))  # in valid region
+    g = t.update(None, (1000, 600), (300, 500))    # then lost
+    assert g.state == "reached", g.state
+    assert g.endpoint and g.reached_valid, (g.endpoint, g.reached_valid)
+
+
+def test_no_endpoint_without_valid():
+    # pupil never entered the valid region -> losing it is just "searching".
+    t = guidance.GuidanceTracker()
+    t.update((150, 500), (1000, 600), (300, 500))  # 150px > valid(72): not valid
+    g = t.update(None, (1000, 600), (300, 500))
+    assert g.state == "searching" and not g.endpoint, (g.state, g.endpoint)
+
+
 def test_annotate_runs():
     frame = np.zeros((640, 480, 3), np.uint8)
     t = guidance.GuidanceTracker()

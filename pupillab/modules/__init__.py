@@ -8,6 +8,7 @@ montage, and the batch runner with no further wiring.
 
 from . import ridge_baseline   # noqa: F401  — the proven cap.py detector (baseline)
 from . import bonteanu_hough   # noqa: F401  — circular Hough (Bonteanu, literature)
-from . import ritnet_seg       # noqa: F401  — pre-trained RITnet segmentation (ML)
+from . import ritnet_seg       # noqa: F401  — pre-trained RITnet segmentation (torch)
+from . import ncnn_seg         # noqa: F401  — RITnet via ncnn (the Pi/ARMv6 backend)
 
-__all__ = ["ridge_baseline", "bonteanu_hough", "ritnet_seg"]
+__all__ = ["ridge_baseline", "bonteanu_hough", "ritnet_seg", "ncnn_seg"]
