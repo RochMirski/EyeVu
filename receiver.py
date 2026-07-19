@@ -71,7 +71,7 @@ _INDEX_FIELDS = [
     "ritnet_x", "ritnet_y", "ritnet_conf",
     "agree_dist", "chosen_source", "chosen_x", "chosen_y",
     "off_px", "state", "instruction", "target_x", "target_y",
-    "in_valid", "reached_valid", "endpoint", "live_rotation",
+    "in_valid", "reached_valid", "endpoint", "redeye_coverage", "live_rotation",
 ]
 
 
@@ -92,10 +92,25 @@ def _append_index_row(row):
 
 
 def _maybe_run_guidance(folder, dest_dir):
-    """Run guidance + categorise/sort once a folder has ambient + flash + meta."""
+    """Run guidance + categorise/sort once a folder has its frames + meta.
+
+    meta.json arrives FIRST (it carries the centred pupil coords), so read it to
+    learn which raw frames to wait for (ambient + flash [+ dark]) before firing.
+    """
     if folder in _PROCESSED:
         return
-    need = ("ambient.jpg", "flash.jpg", "meta.json")
+    import json
+    meta_path = os.path.join(dest_dir, "meta.json")
+    if not os.path.isfile(meta_path):
+        return
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return
+    need = ["ambient.jpg", "flash.jpg"]
+    if meta.get("has_dark"):
+        need.append("dark.jpg")
     if not all(os.path.isfile(os.path.join(dest_dir, n)) for n in need):
         return
     _PROCESSED.add(folder)
@@ -169,6 +184,29 @@ def _run_guidance(folder, dest_dir):
     vis = guidance.annotate(cv2.convertScaleAbs(fla_bgr, alpha=3.0), g, target, center)
     cv2.imwrite(os.path.join(dest_dir, "guidance.jpg"), vis)
 
+    # Red-eye / fundus extraction (shared cap.redeye_extract) — prefer the centred
+    # live-frame pupil coords from meta (already in display orientation); else the
+    # locally-detected centre when validly located.  Uses the all-off dark frame.
+    redeye = None
+    dark_path = os.path.join(dest_dir, "dark.jpg")
+    meta_center = meta.get("pupil_center")
+    re_center = tuple(meta_center) if meta_center else center
+    re_ok = (meta_center is not None
+             or (center is not None and (g.in_valid_region or g.reached_valid)))
+    if re_center is not None and re_ok and os.path.isfile(dark_path):
+        dark = np.array(Image.open(dark_path).convert("RGB"))
+        dark_bgr = cv2.cvtColor(dark, cv2.COLOR_RGB2BGR)
+        if rot is not None:
+            dark_bgr = cv2.rotate(dark_bgr, rot)
+        redeye = cap.redeye_extract(fla_bgr, dark_bgr, amb_bgr, re_center,
+                                    chosen[1] if chosen else None, cover)
+        if redeye.valid:
+            cv2.imwrite(os.path.join(dest_dir, "redeye_overlay.jpg"), redeye.overlay)
+            cv2.imwrite(os.path.join(dest_dir, "redeye_extract.jpg"), redeye.extract)
+            cv2.imwrite(os.path.join(dest_dir, "redeye_mask.png"), redeye.mask)
+        print(f"  >>> REDEYE [{folder}]: "
+              f"{'valid' if redeye.valid else 'skipped'} - {redeye.notes}")
+
     # Log the raw detection numbers (both detectors) to Transfers/index.csv.
     def _xy(d):                                  # (x, y) or ("", "")
         return (round(d[0][0], 1), round(d[0][1], 1)) if d else ("", "")
@@ -192,6 +230,7 @@ def _run_guidance(folder, dest_dir):
         "target_x": target[0], "target_y": target[1],
         "in_valid": int(g.in_valid_region), "reached_valid": int(g.reached_valid),
         "endpoint": int(g.endpoint),
+        "redeye_coverage": round(redeye.coverage, 3) if redeye and redeye.valid else "",
         "live_rotation": cap.LIVE_ROTATION,
     })
     return category

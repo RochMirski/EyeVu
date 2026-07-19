@@ -22,3 +22,11 @@ capture_20260718_181204,ritnet_only,,,,,497.3,739.3,0.959,,ritnet,497.3,739.3,10
 capture_20260718_181258,both,667.0,771.6,0.417,ambient,604.6,803.2,0.952,69.9,ritnet,604.6,803.2,205.3,move,"Move down and right - wrong way, reverse",480,640,3
 capture_20260718_181446,ridge_only,550.4,748.7,0.448,ambient,,,,,ambient,550.4,748.7,129.5,move,Move down and right - keep going,480,640,3
 capture_20260718_181926,ritnet_only,,,,,802.0,736.7,0.966,,ritnet,802.0,736.7,336.3,move,"Move down and right a lot - wrong way, reverse",480,640,3
+capture_20260718_212913,ritnet_only,,,,,463.5,735.2,0.976,,ritnet,463.5,735.2,96.6,move,Move down - almost there,480,640,3
+capture_20260718_215000,ritnet_only,,,,,507.8,695.6,0.984,,ritnet,507.8,695.6,62.1,move,Move down and right a little - almost there,480,640,3
+capture_20260718_215013,ritnet_only,,,,,535.0,698.7,0.99,,ritnet,535.0,698.7,80.5,move,Move down and right a little,480,640,3
+capture_20260718_215024,ritnet_only,,,,,556.1,692.2,0.979,,ritnet,556.1,692.2,92.2,move,Move down and right a little,480,640,3
+capture_20260719_135145,ridge_only,517.0,697.0,0.576,redeye,,,,,redeye,517.0,697.0,730.2,move,Move up and right a lot,76,1279,0,0,0,,3
+capture_20260719_183341,ridge_only,465.6,655.4,0.406,ambient,,,,,ambient,465.6,655.4,735.3,move,Move up and right a lot,76,1279,0,0,0,,3
+capture_20260719_183455,both,486.2,691.5,0.677,ambient,468.7,708.9,0.988,24.7,ritnet,468.7,708.9,692.3,move,Move up and right a lot - keep going,76,1279,0,0,0,,3
+capture_20260719_232106,ridge_only,850.7,1021.3,0.365,ambient,,,,,ambient,850.7,1021.3,816.5,move,"Move up and right a lot - wrong way, reverse",76,1279,0,0,0,0.509,3

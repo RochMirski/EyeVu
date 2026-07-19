@@ -62,6 +62,7 @@ import json
 import urllib.request
 import urllib.error
 from datetime import datetime
+from dataclasses import dataclass
 from PIL import Image, ImageEnhance
 import numpy as np
 
@@ -474,15 +475,26 @@ _LAST_ANCHOR = None
 _LAST_PUPIL = None
 _LAST_CONF = 0.0
 
-# Alignment-guidance state (used by capture_image when PI_DETECT is on).  The
-# tracker carries the previous capture's offset for relative phrasing; the prior
-# is the last pupil centre (display orientation) that seeds the next search.
+# Alignment-guidance state for the LIVE feed (guidance is done live now, not at
+# capture).  The tracker carries the previous frame's offset for relative phrasing;
+# the prior is the last pupil centre (display orientation) that seeds the next search.
 _GUIDANCE_TRACKER = None
 _GUIDANCE_PRIOR = None
 GUIDANCE_TARGET_MODE = "cover_top_mid" # drive the pupil to the LED-cover inner edge
                                        # ("centre" = image centre; toggle: target_mode)
 GUIDANCE_USE_ML = True                 # let coarse_locate try RITnet (if present)
 GUIDANCE_WINDOW = "Alignment Guidance" # Pi cv2 window the annotated capture is shown in
+
+# Auto-capture: when live guidance (g) reports the pupil CENTRED and auto-capture is
+# armed, turn the ambient LEDs off, wait AUTOCAP_DILATE s for the pupil to dilate,
+# then run the standard flash procedure.  After a take it DISARMS — the operator
+# re-authorises the next search-and-take with `k`.
+AUTOCAP_DILATE = 1.5                    # seconds to dilate (ambient off) before flash
+AUTOCAP_COOLDOWN = 3.0                  # min seconds between auto-captures (backstop)
+AUTOCAP_CENTRED_FRAMES = 2             # consecutive centred detections before firing
+
+# Show the red-pixel (red-eye) extraction on the Pi AFTER a capture's transfer.
+REDEYE_PREVIEW = True
 
 # RITnet is slow on the Pi (ncnn on ARMv6 ~ minutes/frame), so by default it runs
 # only when the cheap ridge/red-eye cue is weak (missing or below RITNET_CONF_GATE)
@@ -2146,6 +2158,129 @@ def classify_detection(ridge, ritnet, shape, agree_frac=DETECT_AGREE_FRAC):
     return ("ridge_only", ridge) if ridge[2] >= ritnet[2] else ("ritnet_only", ritnet)
 
 
+# ───────── RED-EYE / FUNDUS REGION EXTRACTION ─────────
+_REDEYE_ROI_MULT = 1.8          # search radius = this x detected pupil radius
+_REDEYE_ROI_MIN_FRAC = 0.06     # ...but at least this x min(h, w)
+_REDEYE_MIN_SHIFT = 18          # floor on the red-shift score to select a pixel
+_REDEYE_AMBIENT_DARK = 90       # ambient luma below this = "was dark" (soft prior)
+_REDEYE_AMBIENT_BOOST = 12      # red-shift boost where the pixel read dark in ambient
+_REDEYE_SPECULAR_DILATE = 9     # grow the specular / corneal-reflex exclusion
+
+
+@dataclass
+class RedeyeResult:
+    valid: bool = False
+    mask: object = None            # uint8 (H, W) selection, or None
+    overlay: object = None         # BGR highlight image (always set)
+    extract: object = None         # BGR isolated region on black, or None
+    coverage: float = 0.0          # selected px / ROI px
+    notes: str = ""
+
+
+def redeye_extract(flash_bgr, dark_bgr, ambient_bgr, center, radius,
+                   cover_mask=None):
+    """Isolate the flash retroreflection (fundus red-eye) pixels near the pupil.
+
+    Selects pixels that shifted most toward red vs the all-off `dark_bgr` (softly
+    biased by having read dark in `ambient_bgr`), inside a generous region around
+    the detected pupil `center`/`radius` (detection is imperfect, hence 'around' —
+    the selection shape is arbitrary, not a circle).  Corneal reflections /
+    speculars are EXCLUDED (kept raw, NOT inpainted).  Only runs when the pupil is
+    validly located and not centred on the LED cover.  All frames must be in the
+    same (display) orientation.  Returns a RedeyeResult; `overlay` always renders
+    (highlight, or an INVALID banner) so the caller can save/show it.
+    """
+    res = RedeyeResult()
+    base = cv2.convertScaleAbs(flash_bgr, alpha=3.0) if flash_bgr is not None else None
+
+    def _banner(msg):
+        vis = base.copy() if base is not None else np.zeros((16, 16, 3), np.uint8)
+        for col, th in (((0, 0, 0), 4), ((0, 0, 255), 1)):
+            cv2.putText(vis, f"REDEYE INVALID: {msg}", (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, th, cv2.LINE_AA)
+        res.overlay = vis
+        res.notes = msg
+        return res
+
+    if not CV2_AVAILABLE or flash_bgr is None or dark_bgr is None:
+        return _banner("frames unavailable")
+    h, w = flash_bgr.shape[:2]
+    if center is None:
+        return _banner("no pupil")
+    cx, cy = int(center[0]), int(center[1])
+    if not (0 <= cx < w and 0 <= cy < h):
+        return _banner("pupil out of frame")
+    if (cover_mask is not None and cover_mask.shape[:2] == (h, w)
+            and cover_mask[cy, cx] > 0):
+        return _banner("pupil on LED cover")
+
+    r = float(radius) if radius else _REDEYE_ROI_MIN_FRAC * min(h, w)
+    roi_r = int(max(_REDEYE_ROI_MULT * r, _REDEYE_ROI_MIN_FRAC * min(h, w)))
+    roi = np.zeros((h, w), np.uint8)
+    cv2.circle(roi, (cx, cy), roi_r, 255, -1)
+
+    f = flash_bgr.astype(np.int16)
+    d = dark_bgr.astype(np.int16)
+    # Red rose more than blue vs the all-off dark frame == "became reddish".
+    redshift = (f[:, :, 2] - d[:, :, 2]) - (f[:, :, 0] - d[:, :, 0])
+    warm = f[:, :, 2] > f[:, :, 0]                  # genuinely warm in the flash
+    if ambient_bgr is not None and ambient_bgr.shape[:2] == (h, w):
+        aluma = ambient_bgr.astype(np.int16).mean(axis=2)
+        redshift = redshift + np.where(aluma < _REDEYE_AMBIENT_DARK,
+                                       _REDEYE_AMBIENT_BOOST, 0)
+
+    # Adaptive floor from the ROI's red-shift distribution (Otsu), with a fixed min.
+    rs_pos = np.clip(redshift, 0, 255).astype(np.uint8)
+    roi_vals = rs_pos[roi > 0]
+    otsu = _REDEYE_MIN_SHIFT
+    if roi_vals.size:
+        otsu, _ = cv2.threshold(roi_vals.reshape(-1, 1), 0, 255,
+                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    floor = max(_REDEYE_MIN_SHIFT, float(otsu))
+    mask = ((redshift >= floor) & warm & (roi > 0)).astype(np.uint8) * 255
+
+    # Exclude corneal reflections / speculars (do NOT inpaint them here).
+    fgray = cv2.cvtColor(flash_bgr, cv2.COLOR_BGR2GRAY)
+    _, spec = cv2.threshold(fgray, _INPAINT_BRIGHT_THRESH, 255, cv2.THRESH_BINARY)
+    reflex = _find_corneal_reflex(fgray)
+    if reflex is not None:
+        spec = cv2.bitwise_or(spec, reflex[3])
+    spec = cv2.dilate(spec, cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_REDEYE_SPECULAR_DILATE, _REDEYE_SPECULAR_DILATE)))
+    mask[spec > 0] = 0
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+
+    roi_area = int(cv2.countNonZero(roi))
+    sel_area = int(cv2.countNonZero(mask))
+    res.coverage = sel_area / roi_area if roi_area else 0.0
+
+    extract = np.zeros_like(flash_bgr)
+    extract[mask > 0] = flash_bgr[mask > 0]         # isolated region, original colour
+
+    overlay = base.copy()
+    if sel_area:
+        overlay[mask > 0] = (0.35 * overlay[mask > 0]
+                             + 0.65 * np.array([0, 255, 0])).astype(np.uint8)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, cnts, -1, (0, 255, 0), 1)
+    overlay[(spec > 0) & (roi > 0)] = (0, 0, 255)   # excluded speculars, in the ROI
+    cv2.circle(overlay, (cx, cy), roi_r, (255, 255, 0), 1)
+    cv2.circle(overlay, (cx, cy), 3, (255, 0, 255), -1)
+    for col, th in (((0, 0, 0), 3), ((0, 255, 0), 1)):
+        cv2.putText(overlay, f"redeye px={sel_area} cov={res.coverage:.2f}",
+                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, th, cv2.LINE_AA)
+
+    res.valid = True
+    res.mask = mask
+    res.overlay = overlay
+    res.extract = extract
+    res.notes = f"{sel_area}px in ROI r={roi_r}"
+    return res
+
+
 def _post_to_receiver(folder, filename, data):
     """POST raw bytes to receiver.py as /upload/<folder>/<filename>.
 
@@ -2187,17 +2322,17 @@ def upload_calibration_image(bgr):
     return False
 
 
-def transfer_capture(ambient_array, flash_array, both_array=None, detect_bgr=None):
+def transfer_capture(ambient_array, flash_array, both_array=None, detect_bgr=None,
+                     dark_array=None, redeye=None, pupil_center=None):
     """Stage the raw capture frames locally and POST them to the dev machine.
 
-    Writes LOCAL_STAGING_DIR/capture_<timestamp>/{ambient.jpg, flash.jpg,
-    both.jpg, detect.jpg, meta.json}, then uploads each via HTTP POST to
-    receiver.py.  `both.jpg` (flash+ambient) is included when captured;
-    `detect.jpg` (BGR) is the Pi-side overlay of what BOTH detectors found +
-    the guidance, included when PI_DETECT produced one.  The raw images are saved
-    (no overlay) so the harness can re-run detection cleanly; meta.json records
-    LIVE_ROTATION.  meta.json is uploaded LAST so the receiver only triggers once
-    the whole folder (incl. detect.jpg) has arrived.
+    Writes LOCAL_STAGING_DIR/capture_<timestamp>/{ambient.jpg, flash.jpg, both.jpg,
+    dark.jpg, detect.jpg, redeye_overlay.jpg, redeye_extract.jpg, redeye_mask.png,
+    meta.json}, then uploads each via HTTP POST to receiver.py.  The raw frames
+    (ambient/flash/both/dark) are saved un-annotated so the harness can re-run
+    detection + red-eye extraction cleanly; `detect.jpg` and the `redeye_*` files
+    are the Pi-side overlays/outputs.  meta.json is uploaded LAST so the receiver
+    only triggers once the whole folder has arrived.
 
     Any failure is reported on the Pi but never raised — a transfer problem
     must not interrupt capture or streaming.
@@ -2217,9 +2352,17 @@ def transfer_capture(ambient_array, flash_array, both_array=None, detect_bgr=Non
         if both_array is not None:
             Image.fromarray(both_array).save(os.path.join(folder, "both.jpg"))
             fnames.append("both.jpg")
+        if dark_array is not None:
+            Image.fromarray(dark_array).save(os.path.join(folder, "dark.jpg"))
+            fnames.append("dark.jpg")
         if detect_bgr is not None and CV2_AVAILABLE:
             cv2.imwrite(os.path.join(folder, "detect.jpg"), detect_bgr)
             fnames.append("detect.jpg")
+        if redeye is not None and redeye.valid and CV2_AVAILABLE:
+            cv2.imwrite(os.path.join(folder, "redeye_overlay.jpg"), redeye.overlay)
+            cv2.imwrite(os.path.join(folder, "redeye_extract.jpg"), redeye.extract)
+            cv2.imwrite(os.path.join(folder, "redeye_mask.png"), redeye.mask)
+            fnames += ["redeye_overlay.jpg", "redeye_extract.jpg", "redeye_mask.png"]
         meta = {
             "timestamp":     stamp,
             "live_rotation": LIVE_ROTATION,
@@ -2231,30 +2374,39 @@ def transfer_capture(ambient_array, flash_array, both_array=None, detect_bgr=Non
             "contrast":      CONTRAST,
             "swirski_debug": SWIRSKI_DEBUG,
             "has_both":      both_array is not None,
+            "has_dark":      dark_array is not None,
+            "pupil_center":  ([round(float(pupil_center[0]), 1),
+                               round(float(pupil_center[1]), 1)]
+                              if pupil_center is not None else None),
         }
         with open(os.path.join(folder, "meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
-        fnames.append("meta.json")             # uploaded last -> receiver trigger
+        fnames.append("meta.json")             # reordered FIRST for the upload below
     except OSError as e:
         print(f"[TRANSFER ERROR] could not stage capture: {e}")
         return
 
-    # ── upload each file to receiver.py on the dev machine ──
+    # ── upload to receiver.py: meta.json FIRST (it carries the centred pupil
+    #    coords), then the rest; abort on the FIRST failure (don't bother with the
+    #    others) so a dropped file doesn't waste time on the remainder. ──
+    order = ["meta.json"] + [f for f in fnames if f != "meta.json"]
     folder_name = f"capture_{stamp}"
-    failed = False
-    for fname in fnames:
+    ok = True
+    for fname in order:
         try:
             with open(os.path.join(folder, fname), "rb") as f:
                 data = f.read()
         except OSError as e:
             print(f"[TRANSFER ERROR] {fname}: {e}")
-            failed = True
-            continue
+            ok = False
+            break
         if not _post_to_receiver(folder_name, fname, data):
-            failed = True
+            print(f"[TRANSFER] {fname} failed - aborting the rest.")
+            ok = False
+            break
 
-    if not failed:
-        print(f"Transferred {folder_name} to {REMOTE_HOST}.")
+    print(f"Transferred {folder_name} to {REMOTE_HOST}." if ok
+          else f"Transfer of {folder_name} aborted (a file failed).")
 
 
 def _drain_frames(picam2, n=FLUSH_FRAMES):
@@ -2270,17 +2422,22 @@ def _drain_frames(picam2, n=FLUSH_FRAMES):
         picam2.capture_array()
 
 
-def capture_image(picam2):
-    """Capture a flash / flash+ambient / ambient triple and (optionally) detect.
+def capture_image(picam2, live_center_frac=None, live_radius_frac=None):
+    """Capture a dark / flash / flash+ambient / ambient set and extract the red-eye.
+
+    `live_center_frac` = (fx, fy) and `live_radius_frac` = fr are the pupil region
+    (fractions of frame width/height) carried over from the last centred live frame.
+    They locate the red-eye extraction — there is NO pupil detection at capture time.
+
 
     Three frames in one short LED sequence (the eye barely moves between them):
       1.  flash only      — retina retroreflection, pupil still dilated
       2.  flash + ambient — eye structure lit AND the pupil retroreflecting
       3.  ambient only     — the pupil reads as a dark disc
 
-    All three raw frames are transferred to the dev machine.  The raw ambient is
-    saved to AMBIENT_PATH; PHOTO_PATH gets the annotated flash when PI_DETECT is
-    on, else the plain processed flash.
+    All four raw frames are transferred to the dev machine.  The raw ambient is
+    saved to AMBIENT_PATH; PHOTO_PATH gets the red-eye highlight overlay when a live
+    pupil region is known, else the plain processed flash.
     """
     print("Capturing flash / flash+ambient / ambient triple...")
 
@@ -2288,12 +2445,20 @@ def capture_image(picam2):
     time.sleep(0.02)
     _drain_frames(picam2)              # let the new gain take effect
 
-    # The three frames share one short LED sequence (one transition each), so the
-    # eye barely moves between them:
-    #   1) flash only       — retina retroreflection, pupil still dilated
+    # Four frames in one short LED sequence (the eye barely moves between them);
+    # dark+flash are captured first, while the pupil is still dilated, so the
+    # flash-minus-dark red-eye extraction is pupil-size-matched:
+    #   0) dark (all off)   — near-black reference for the red-eye extraction
+    #   1) flash only        — retina retroreflection, pupil still dilated
     #   2) flash + ambient   — eye structure lit AND the pupil retroreflecting
-    #                          (eyelid/iris/pupil arcs + a bright pupil in one frame)
-    #   3) ambient only      — the pupil reads as a dark disc
+    #   3) ambient only      — the pupil reads as a dark disc (constricted)
+
+    # ── 0) DARK (all LEDs off) — near-black reference, pupil still dilated ──
+    flash_off()
+    ambient_off()
+    time.sleep(FLASH_PRE_DELAY)
+    _drain_frames(picam2)              # flush frames exposed under the previous state
+    dark_array = picam2.capture_array()
 
     # ── 1) FLASH ONLY (GPIO 17) ──
     flash_on()
@@ -2320,32 +2485,46 @@ def capture_image(picam2):
     # Save the raw ambient image for inspection
     Image.fromarray(ambient_array).save(AMBIENT_PATH)
 
-    # ───────── PUPIL DETECTION + ALIGNMENT GUIDANCE ─────────
-    # Off by default (PI_DETECT): the Pi just captures + transfers, and the dev
-    # machine (receiver.py) runs detection + guidance on the received triple.
-    # When PI_DETECT is on, run detection here (capture time only, never in live
-    # preview): overlay what BOTH detectors found + the guidance into detect.jpg,
-    # which is transferred alongside the raw triple.  Wrapped so a detection error
-    # never aborts the capture/transfer or drops out of streaming.
+    # ───────── RED-EYE EXTRACTION (no pupil detection) ─────────
+    # Alignment is done live; here we just isolate the red-eye pixels using the pupil
+    # region carried over from the last centred live frame (live_center/radius_frac).
+    # Produces the red-eye highlight overlay (detect.jpg) + outputs, transferred with
+    # the raw frames.  Wrapped so an extraction error never aborts capture/transfer.
     detect_bgr = None
+    redeye = None
+    pupil_center = None
     img = None
-    if PI_DETECT and CV2_AVAILABLE:
+    if CV2_AVAILABLE:
         try:
-            detect_bgr = _guide_capture(ambient_array, flash_array)   # BGR overlay
+            detect_bgr, redeye, pupil_center = _redeye_capture(
+                ambient_array, flash_array, dark_array,
+                live_center_frac, live_radius_frac)
             img = Image.fromarray(cv2.cvtColor(detect_bgr, cv2.COLOR_BGR2RGB))
         except Exception as e:                     # noqa: BLE001
             import traceback
-            print(f"[DETECT ERROR] {e!r}")
+            print(f"[REDEYE ERROR] {e!r}")
             traceback.print_exc()
     if img is None:
         img = process_image(flash_array, [])
 
     # ───────── IMAGE TRANSFER ─────────
-    # Push the raw triple (+ detect.jpg) to the dev machine.
-    transfer_capture(ambient_array, flash_array, both_array, detect_bgr)
+    # Push the raw 4 frames (+ detect.jpg + red-eye outputs); meta.json (with the
+    # centred pupil coords) is uploaded FIRST and the rest abort on any failure.
+    transfer_capture(ambient_array, flash_array, both_array, detect_bgr,
+                     dark_array, redeye, pupil_center)
 
     # Save the annotated flash photo locally
     img.save(PHOTO_PATH)
+
+    # Red-pixel preview on the Pi, AFTER the transfer attempt (if enabled).
+    if REDEYE_PREVIEW and CV2_AVAILABLE and redeye is not None \
+            and redeye.overlay is not None:
+        ro = redeye.overlay
+        if ro.shape[0] > 720:
+            s = 720.0 / ro.shape[0]
+            ro = cv2.resize(ro, (int(ro.shape[1] * s), 720))
+        cv2.imshow("Red-eye extraction", ro)
+        cv2.waitKey(1)
 
     print("Captured.")
 
@@ -2373,63 +2552,48 @@ def _draw_detections(vis, ridge, ritnet, category):
     return vis
 
 
-def _guide_capture(ambient_array, flash_array):
-    """Run BOTH detectors + alignment guidance on one capture; return the BGR
-    overlay (what ridge AND RITnet found, plus the guidance target/arrow/text).
+def _redeye_capture(ambient_array, flash_array, dark_array=None,
+                    live_center_frac=None, live_radius_frac=None):
+    """Extract the red-eye (fundus) pixels on a capture — no pupil detection here.
 
-    Stateful across captures (module-level tracker + prior) so the instruction can
-    refine relative to the previous move ("keep going" / "almost there").
+    The pupil region is carried over from the last centred LIVE frame:
+    `live_center_frac`=(fx, fy) and `live_radius_frac`=fr are fractions of the
+    captured frame's width/height, giving the red-eye centre and ROI size.  All
+    alignment/guidance work happens live; this only isolates the red pixels.
+
+    Returns (overlay_bgr, redeye, pupil_center) — the red-eye highlight overlay (or
+    a brightened flash if no region is known), the RedeyeResult (or None), and the
+    full-frame pupil coords used.
     """
-    global _GUIDANCE_TRACKER, _GUIDANCE_PRIOR
-    import guidance
-    if _GUIDANCE_TRACKER is None:
-        _GUIDANCE_TRACKER = guidance.GuidanceTracker()
-
     rot = _CV2_ROTATIONS[LIVE_ROTATION]
     amb_bgr = cv2.cvtColor(ambient_array, cv2.COLOR_RGB2BGR)
     flash_bgr = cv2.cvtColor(flash_array, cv2.COLOR_RGB2BGR)
+    dark_bgr = (cv2.cvtColor(dark_array, cv2.COLOR_RGB2BGR)
+                if dark_array is not None else None)
     if rot is not None:
         amb_bgr = cv2.rotate(amb_bgr, rot)
         flash_bgr = cv2.rotate(flash_bgr, rot)
+        if dark_bgr is not None:
+            dark_bgr = cv2.rotate(dark_bgr, rot)
 
-    cover_mask = load_cover_mask(amb_bgr.shape[:2])
-    # Run the traditional (ridge/red-eye) and NN (RITnet) detectors separately so
-    # we can show both; the gated cascade decides which drives the guidance.
-    ridge, ritnet = detect_both(amb_bgr, flash_bgr, cover_mask, _GUIDANCE_PRIOR,
-                                allow_ml=GUIDANCE_USE_ML)
-    category, chosen = classify_detection(ridge, ritnet, amb_bgr.shape)
-    center = chosen[0] if chosen else None
-    conf = chosen[2] if chosen else 0.0
-    source = chosen[3] if chosen else ""
+    h, w = flash_bgr.shape[:2]
+    center = radius = None
+    if live_center_frac is not None:
+        center = (float(live_center_frac[0]) * w, float(live_center_frac[1]) * h)
+        if live_radius_frac:
+            radius = float(live_radius_frac) * w
 
-    target = guidance.target_point(flash_bgr.shape, cover_mask, GUIDANCE_TARGET_MODE)
-    g = _GUIDANCE_TRACKER.update(center, flash_bgr.shape, target, conf, source)
-    _GUIDANCE_PRIOR = center if center is not None else _GUIDANCE_PRIOR
-    rs = f"{ridge[2]:.2f}" if ridge else "-"
-    ns = f"{ritnet[2]:.2f}" if ritnet else "-"
-    verify = ("  >>> ENDPOINT: pupil was at the cover edge then lost - ALIGNED or "
-              "BLOCKED (check for fundus)" if g.endpoint
-              else "  [in valid region]" if g.in_valid_region
-              else "  [reached valid region earlier]" if g.reached_valid else "")
-    print(f"GUIDANCE [{category}]: {g.instruction}"
-          + (f"  off={g.distance:.0f}px {source} conf={conf:.2f}" if center else "")
-          + f"  (ridge {rs}, nn {ns}){verify}")
+    cover_mask = load_cover_mask((h, w))
+    redeye = None
+    if dark_bgr is not None and center is not None:
+        redeye = redeye_extract(flash_bgr, dark_bgr, amb_bgr, center, radius, cover_mask)
+        print(f"  REDEYE: {'valid' if redeye.valid else 'skipped'} - {redeye.notes}")
+    elif center is None:
+        print("  REDEYE: skipped - no live pupil region (align in live mode first)")
 
-    vis = guidance.annotate(cv2.convertScaleAbs(flash_bgr, alpha=3.0), g, target, center)
-    _draw_detections(vis, ridge, ritnet, category)
-
-    # Show it in a cv2 window so the operator sees it on the Pi (the xdg-open
-    # viewer usually does not auto-refresh).  Responsive inside the streaming loop.
-    if CV2_AVAILABLE:
-        disp = vis
-        h0 = disp.shape[0]
-        if h0 > 720:
-            s = 720.0 / h0
-            disp = cv2.resize(disp, (int(disp.shape[1] * s), 720))
-        cv2.imshow(GUIDANCE_WINDOW, disp)
-        cv2.waitKey(1)
-
-    return vis
+    vis = (redeye.overlay if (redeye is not None and redeye.overlay is not None)
+           else cv2.convertScaleAbs(flash_bgr, alpha=3.0))
+    return vis, redeye, center
 
 
 def _ship_calibration(bgr):
@@ -2504,7 +2668,8 @@ def streaming_mode(picam2):
     SPACE (hold) / r — flash LED (GPIO 17), hold / lock
     a               — toggle ambient LED (GPIO 22/27/23/6/26/16)
     p               — toggle live Orlosky pupil detection
-    g               — toggle the live guidance arrow (target + arrow + instruction)
+    g               — toggle the live guidance arrow (arms auto-capture when centred)
+    k               — authorise the next auto-capture (after one fires)
     t               — toggle PC image transfer (HTTP-POST to receiver.py)
     f               — flip to the other eye (cover top<->bottom, 180°)
     m               — toggle RITnet: every capture <-> only when ridge weak
@@ -2517,7 +2682,6 @@ def streaming_mode(picam2):
 
     global LIVE_ROTATION
     global TRANSFER_ENABLED
-    global RITNET_ALWAYS
 
     if not CV2_AVAILABLE:
         print("cv2 not available - cannot show live feed.")
@@ -2525,8 +2689,8 @@ def streaming_mode(picam2):
 
     print("\nStreaming mode ON")
     print("SPACE=flash | r=lock | a=ambient | p=pupil-detect | g=guide-arrow | "
-          "t=pc-transfer | f=flip-eye | m=ritnet-mode | c=calibrate-cover | "
-          "←/→=rotate | ENTER/e=capture | s=exit\n")
+          "k=authorise-autocap | t=pc-transfer | f=flip-eye | "
+          "c=calibrate-cover | ←/→=rotate | ENTER/e=capture | s=exit\n")
 
     apply_camera_settings(picam2, FLASH_GAIN)
 
@@ -2562,6 +2726,10 @@ def streaming_mode(picam2):
     live_guide_on = False                  # 'g': draw the guidance arrow live
     _live_guide = guidance.GuidanceTracker()
     _live_center = None
+    _live_radius = None                    # live pupil radius (disp px) -> red-eye ROI
+    _autocap_armed = False                 # auto-capture when centred (armed by 'g'/'k')
+    _centred_count = 0
+    _last_autocap = 0.0
     _detect_counter = 0
     _overlay_cache = None
     exit_reason = "unknown"
@@ -2593,12 +2761,17 @@ def streaming_mode(picam2):
             # the pupil overlay (p) OR live guidance (g) is on.
             if swirski_live_on or live_guide_on:
                 _detect_counter += 1
-                if (_overlay_cache is None
-                        or _detect_counter % _LIVE_DETECT_SKIP == 0):
+                fresh = (_overlay_cache is None
+                         or _detect_counter % _LIVE_DETECT_SKIP == 0)
+                if fresh:
                     gray = cv2.cvtColor(disp, cv2.COLOR_BGR2GRAY)
                     _overlay_cache = detect_pupil(gray, live=True)
-                    _live_center = ((_LAST_PUPIL[0], _LAST_PUPIL[1])
-                                    if _LAST_PUPIL is not None else None)
+                    if _LAST_PUPIL is not None:
+                        _live_center = (_LAST_PUPIL[0], _LAST_PUPIL[1])
+                        _live_radius = _LAST_PUPIL[2]
+                    else:
+                        _live_center = None
+                        _live_radius = None
                 if swirski_live_on and _overlay_cache:
                     disp = _draw_overlays(disp.copy(), _overlay_cache)
                 # Live guidance arrow: target the LED-cover edge, arrow from it to
@@ -2610,6 +2783,36 @@ def streaming_mode(picam2):
                                                 GUIDANCE_TARGET_MODE)
                     lg = _live_guide.update(_live_center, disp.shape, tgt, 1.0, "live")
                     disp = guidance.annotate(disp, lg, tgt, _live_center)
+
+                    # Auto-capture when centred (only on fresh detections; debounced,
+                    # armed, cooled-down).  Disarms after firing -> 'k' re-authorises.
+                    if fresh:
+                        _centred_count = _centred_count + 1 if lg.state == "centred" else 0
+                        if (_autocap_armed and _centred_count >= AUTOCAP_CENTRED_FRAMES
+                                and time.time() - _last_autocap > AUTOCAP_COOLDOWN):
+                            _autocap_armed = False
+                            _last_autocap = time.time()
+                            _centred_count = 0
+                            # Fractional pupil region from THIS centred live frame
+                            # (disp space) -> used as the red-eye location + ROI size.
+                            frac = ((_live_center[0] / disp.shape[1],
+                                     _live_center[1] / disp.shape[0])
+                                    if _live_center is not None else None)
+                            rad_frac = (_live_radius / disp.shape[1]
+                                        if _live_radius else None)
+                            print(f"Centred in live feed -> auto-capture: ambient off, "
+                                  f"dilating {AUTOCAP_DILATE:.1f}s, then flash. "
+                                  f"(press 'k' to authorise the next)")
+                            if ambient_led_on:
+                                ambient_off()
+                            flash_off(); led_on = False
+                            cv2.imshow(WINDOW_NAME, disp); cv2.waitKey(1)
+                            time.sleep(AUTOCAP_DILATE)     # pupil dilation
+                            capture_image(picam2, frac, rad_frac)
+                            if ambient_led_on:
+                                ambient_on()
+                            apply_camera_settings(picam2, FLASH_GAIN)
+                            _live_guide.reset()
 
             cv2.imshow(WINDOW_NAME, disp)
 
@@ -2628,12 +2831,19 @@ def streaming_mode(picam2):
                 exit_reason = "'s' pressed"
                 break
 
-            # Capture still: ENTER or e
+            # Capture still: ENTER or e.  Uses the current live pupil region for the
+            # red-eye extraction (no capture-time detection); needs the live overlay
+            # ('p') or guidance ('g') on so a pupil is being tracked.
             if key in (13, 10) or key == ord('e'):
                 flash_off()
                 led_on = False
                 last_space_time = 0.0
-                capture_image(picam2)
+                cfrac = ((_live_center[0] / disp.shape[1],
+                          _live_center[1] / disp.shape[0])
+                         if _live_center is not None else None)
+                rfrac = (_live_radius / disp.shape[1]
+                         if (cfrac is not None and _live_radius) else None)
+                capture_image(picam2, cfrac, rfrac)
                 # capture_image manages both LEDs itself; restore the ambient
                 # LED to whatever state streaming had it in
                 if ambient_led_on:
@@ -2665,12 +2875,24 @@ def streaming_mode(picam2):
                 print(f"Live pupil detection: "
                       f"{'ON' if swirski_live_on else 'OFF'}")
 
-            # g toggles the live guidance arrow (target + arrow + instruction)
+            # g toggles the live guidance arrow (target + arrow + instruction).
+            # Turning it on ARMS the first auto-capture (fires when centred).
             elif key == ord('g'):
                 live_guide_on = not live_guide_on
                 _live_guide.reset()
                 _overlay_cache = None
-                print(f"Live guidance arrow: {'ON' if live_guide_on else 'OFF'}")
+                _centred_count = 0
+                _autocap_armed = live_guide_on
+                print(f"Live guidance arrow: {'ON (auto-capture armed)' if live_guide_on else 'OFF'}")
+
+            # k re-authorises the next auto-capture (after one has fired)
+            elif key == ord('k'):
+                if live_guide_on:
+                    _autocap_armed = True
+                    _centred_count = 0
+                    print("Auto-capture authorised - align to centre for the next take.")
+                else:
+                    print("Turn on live guidance ('g') first.")
 
             # t toggles PC image transfer (HTTP-POST captures to receiver.py)
             elif key == ord('t'):
@@ -2683,11 +2905,6 @@ def streaming_mode(picam2):
                 _set_cover_side("bottom" if COVER_SIDE == "top" else "top")
                 _overlay_cache = None          # orientation changed -> redetect
                 print(f"Cover side: {COVER_SIDE} (rotation {LIVE_ROTATION * 90}°)")
-
-            # m toggles RITnet: every capture <-> only when ridge is weak
-            elif key == ord('m'):
-                RITNET_ALWAYS = not RITNET_ALWAYS
-                print(f"RITnet: {'every capture' if RITNET_ALWAYS else 'only when ridge weak'}")
 
             # c snaps the current frame as an LED-cover calibration (no eye in
             # place) and ships it — instant, no confirm, LEDs left as locked/on.
@@ -2753,6 +2970,7 @@ def handle_parameter_command(cmd, picam2):
     global USE_COVER_CALIB
     global GUIDANCE_TARGET_MODE, GUIDANCE_USE_ML
     global RITNET_ALWAYS, RITNET_CONF_GATE
+    global REDEYE_PREVIEW
     global _GUIDANCE_TRACKER, _GUIDANCE_PRIOR
 
     parts = cmd.split()
@@ -2835,6 +3053,9 @@ def handle_parameter_command(cmd, picam2):
 
         elif param == "pi_build_calib":
             PI_BUILD_CALIB = bool(int(value))
+
+        elif param == "redeye_preview":
+            REDEYE_PREVIEW = bool(int(value))
 
         # PC image transfer (HTTP-POST capture triples to receiver.py)
         elif param == "transfer":
