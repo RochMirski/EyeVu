@@ -30,3 +30,9 @@ capture_20260719_135145,ridge_only,517.0,697.0,0.576,redeye,,,,,redeye,517.0,697
 capture_20260719_183341,ridge_only,465.6,655.4,0.406,ambient,,,,,ambient,465.6,655.4,735.3,move,Move up and right a lot,76,1279,0,0,0,,3
 capture_20260719_183455,both,486.2,691.5,0.677,ambient,468.7,708.9,0.988,24.7,ritnet,468.7,708.9,692.3,move,Move up and right a lot - keep going,76,1279,0,0,0,,3
 capture_20260719_232106,ridge_only,850.7,1021.3,0.365,ambient,,,,,ambient,850.7,1021.3,816.5,move,"Move up and right a lot - wrong way, reverse",76,1279,0,0,0,0.509,3
+capture_20260811_195325,ridge_only,602.8,602.2,0.219,ambient,,,,,ambient,602.8,602.2,671.9,move,Move up and right a lot,164,1111,0,0,0,0.203,3
+capture_20260811_195402,ridge_only,473.4,833.2,0.385,ambient,,,,,ambient,473.4,833.2,415.8,move,Move up and right a lot - keep going,164,1111,0,0,0,0.425,3
+capture_20260811_195442,ridge_only,485.4,552.8,0.479,ambient,,,,,ambient,485.4,552.8,644.2,move,"Move up and right a lot - wrong way, reverse",164,1111,0,0,0,0.151,3
+capture_20260811_200055,flash_only,,,,,,,,,,,,,sweep,Captured at the gaze-sweep peak (flash + dark only).,164,1111,0,0,0,0.127,3
+capture_20260811_222030,flash_only,,,,,,,,,,,,,sweep,Captured at the gaze-sweep peak (flash + dark only).,164,1111,0,0,0,,3
+capture_20260811_223907,flash_only,,,,,,,,,,,,,sweep,Captured at the gaze-sweep peak (flash + dark only).,164,1111,0,0,0,,3

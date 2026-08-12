@@ -98,6 +98,54 @@ def test_no_endpoint_without_valid():
     assert g.state == "searching" and not g.endpoint, (g.state, g.endpoint)
 
 
+# ── approach-stage camera direction ──
+# The LED cover is bolted to the scope, so it never moves in the frame; closing
+# the cover/pupil gap means moving the PUPIL toward that edge, and image content
+# travels OPPOSITE to camera motion.  Getting this backwards drives the cover away
+# from the pupil, so it is pinned down here in both words and arrow.
+
+def test_close_word_top_cover_moves_camera_down():
+    assert guidance._close_word("top") == "down"
+
+
+def test_close_word_bottom_cover_moves_camera_up():
+    assert guidance._close_word("bottom") == "up"
+
+
+def test_camera_hint_top_cover_says_down():
+    h = guidance.camera_hint((300, 500), (300, 500), (1000, 600), close_to="top")
+    assert "down" in h and "up" not in h, h
+
+
+def test_camera_hint_bottom_cover_says_up():
+    h = guidance.camera_hint((300, 500), (300, 500), (1000, 600), close_to="bottom")
+    assert "up" in h and "down" not in h, h
+
+
+def test_camera_arrow_agrees_with_words():
+    # Screen y grows downward, so "down" must be a POSITIVE dy.
+    for side, want_down in (("top", True), ("bottom", False)):
+        words = guidance.camera_hint((300, 500), (300, 500), (1000, 600),
+                                     close_to=side)
+        vec = guidance.camera_arrow((300, 500), (300, 500), (1000, 600),
+                                    close_to=side)
+        assert vec is not None, side
+        assert (vec[1] > 0) == want_down, (side, words, vec)
+        assert ("down" in words) == (vec[1] > 0), (side, words, vec)
+
+
+def test_camera_arrow_keeps_vertical_dominant():
+    # A modest sideways drift must not swamp the approach's vertical push: the
+    # two components come from different worlds (pixels vs a unit "keep going").
+    vec = guidance.camera_arrow((330, 500), (300, 500), (1000, 600), close_to="top")
+    assert abs(vec[1]) > abs(vec[0]), vec
+
+
+def test_camera_hint_hold_steady_when_on_anchor():
+    h = guidance.camera_hint((300, 500), (300, 500), (1000, 600))
+    assert "hold steady" in h, h
+
+
 def test_annotate_runs():
     frame = np.zeros((640, 480, 3), np.uint8)
     t = guidance.GuidanceTracker()

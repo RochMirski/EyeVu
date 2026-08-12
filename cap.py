@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Retina Flash Photography
 Raspberry Pi Zero + Camera Module V2
@@ -22,7 +22,7 @@ r                   Toggle flash LED lock on/off
 a                   Toggle ambient LED (GPIO 22/27/23/6/26/16) on/off
 p                   Toggle live Orlosky pupil detection
 t                   Toggle PC image transfer (HTTP-POST to receiver.py)
-f                   Flip to the other eye (cover top<->bottom, 180°)
+f                   Flip the cover side (top<->bottom, rotates the feed 180°)
 m                   Toggle RITnet: every capture <-> only when ridge weak
 ←/→                 Rotate live feed
 ENTER or e          Capture still
@@ -59,6 +59,7 @@ import time
 import os
 import sys
 import json
+import math
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -86,6 +87,14 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
     print("Warning: cv2 not available.")
+
+# guidance.py has no cap.py import, so this is safe at module level — but it does
+# import cv2 unconditionally, so it goes behind the same guard: cap.py is expected
+# to stay importable (with CV2_AVAILABLE False) on a machine without OpenCV.
+try:
+    import guidance
+except ImportError:
+    guidance = None
 
 # ML pupil-segmentation backend.  Prefer torch RITnet (PC / aarch64); fall back to
 # ncnn RITnet on boards where torch has no build (ARMv6, e.g. a Pi Zero W).  Both
@@ -438,12 +447,17 @@ _COVER_MASK_CACHE = None         # lazily-loaded (mask_array, shape) cache
 _COVER_CALIB_ROT_CACHE = None    # LIVE_ROTATION the stored mask was calibrated at
 
 # Cover side: which edge of the working (display) image the LED cover intrudes
-# from — "top" for the left eye (default), "bottom" for the right eye.  The two
-# eyes differ by a 180° rig rotation, so switching eye just adds 180° to
-# LIVE_ROTATION; the cover mask is rotated to match in load_cover_mask, and the
-# detection geometry auto-detects the cover side from the mask, so it adapts
-# either way.  Set at startup (prompt) and toggled live with `f` / `cover_side`.
-COVER_SIDE = "top"
+# from — "top" or "bottom".  The two rig orientations differ by a 180° rotation,
+# so switching side just adds 180° to LIVE_ROTATION; the cover mask is rotated to
+# match in load_cover_mask, and the detection geometry reads the cover side back
+# off the mask, so it adapts either way.  Set at startup (prompt) and toggled live
+# with `f` / `cover_side`.
+#
+# The pairing below is what LIVE_ROTATION's default (1 = 90° CCW) actually shows:
+# at rotation 1 the cover comes in at the BOTTOM.  It used to be declared as "top",
+# which inverted every side choice — asking for a top cover produced a bottom one.
+# Do not "tidy" this back to "top" without re-checking the feed.
+COVER_SIDE = "bottom"
 
 # Live mode: only recompute the detection every N frames
 _LIVE_DETECT_SKIP = 5
@@ -480,21 +494,34 @@ _LAST_CONF = 0.0
 # the prior is the last pupil centre (display orientation) that seeds the next search.
 _GUIDANCE_TRACKER = None
 _GUIDANCE_PRIOR = None
-GUIDANCE_TARGET_MODE = "cover_top_mid" # drive the pupil to the LED-cover inner edge
-                                       # ("centre" = image centre; toggle: target_mode)
+GUIDANCE_TARGET_MODE = "centre"        # drive the pupil to the CAMERA CENTRE
+                                       # ("cover_top_mid" = the LED-cover inner edge,
+                                       #  which needs a cover mask; toggle: target_mode)
 GUIDANCE_USE_ML = True                 # let coarse_locate try RITnet (if present)
 GUIDANCE_WINDOW = "Alignment Guidance" # Pi cv2 window the annotated capture is shown in
 
-# Auto-capture: when live guidance (g) reports the pupil CENTRED and auto-capture is
-# armed, turn the ambient LEDs off, wait AUTOCAP_DILATE s for the pupil to dilate,
-# then run the standard flash procedure.  After a take it DISARMS — the operator
-# re-authorises the next search-and-take with `k`.
-AUTOCAP_DILATE = 1.5                    # seconds to dilate (ambient off) before flash
+# Auto-capture: the staged session fires the take itself at the gaze-sweep peak and
+# then DISARMS — the operator re-authorises the next search-and-take with `k`.
+# Before that final shot everything goes dark for AUTOCAP_DILATE s so the pupil can
+# dilate (the sweep has just held the flash on the eye, constricting it).
+AUTOCAP_DILATE = 1.5                    # seconds all-dark to dilate before the flash
 AUTOCAP_COOLDOWN = 3.0                  # min seconds between auto-captures (backstop)
 AUTOCAP_CENTRED_FRAMES = 2             # consecutive centred detections before firing
 
+# Centring stage of the live staged session: a symmetric box the pupil must sit
+# inside before the approach begins.  Wider than tall — the operator still has to
+# close the vertical gap to the cover by hand in the next stage, so y need not be
+# pinned here, while x wants to be reasonably settled.
+CENTRE_DEAD_X_FRAC = 0.06               # half-width
+CENTRE_DEAD_Y_FRAC = 0.09               # half-height
+CENTRE_HOLD_FRAMES = 3                  # consecutive centred detections to hand over
+
 # Show the red-pixel (red-eye) extraction on the Pi AFTER a capture's transfer.
 REDEYE_PREVIEW = True
+
+# Tint the detected red-eye pixels onto the LIVE feed whenever the flash is lit and
+# an all-off reference frame is available.  On by default; SHIFT toggles it live.
+REDEYE_HIGHLIGHT_DEFAULT = True
 
 # RITnet is slow on the Pi (ncnn on ARMv6 ~ minutes/frame), so by default it runs
 # only when the cheap ridge/red-eye cue is weak (missing or below RITNET_CONF_GATE)
@@ -726,6 +753,246 @@ def load_cover_mask(shape):
     if m.shape[:2] != tuple(shape[:2]):
         m = cv2.resize(m, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
     return m
+
+
+# ── LIVE (calibration-free) LED-cover detection ──
+# CURRENTLY OFF (USE_LIVE_COVER below).  The staged session runs
+# centre -> sweep -> capture, driving the pupil to the CAMERA CENTRE
+# (GUIDANCE_TARGET_MODE = "centre") and taking the sweep direction from the
+# COVER_SIDE prompt rather than from a detected cover.  Everything below still
+# works and is kept for when cover-relative targeting is wanted again — flip
+# USE_LIVE_COVER to True and set GUIDANCE_TARGET_MODE = "cover_top_mid".
+USE_LIVE_COVER = False
+#
+# The detector itself locates the cover on the working frame every few frames
+# instead of relying on a stored calibration.
+#
+# Connected components (as _find_led_cover_mask does) does NOT work here: on an
+# ambient-lit frame with an eye in place the cover touches the eye-socket and brow
+# shadow, so the near-black blob either swallows 40% of the frame or trips an area
+# cap and yields nothing.  Measured over the Transfers/ captures, that approach
+# found a cover on barely a third of frames.
+#
+# What IS reliable is the cover's defining property: it is an unbroken dark band
+# entering from ONE edge of the frame.  So instead of labelling blobs, we walk
+# inward from the top edge and from the bottom edge, column by column, and record
+# how deep the dark run goes before the image turns durably bright.  That depth
+# profile IS the cover's outline; the side with the deeper, wider band wins.  A
+# column whose run never ends is the socket shadow, not the cover, and is capped.
+_COVER_LIVE_DARK = 8             # near-black ceiling.  MUCH lower than
+                                 # _LED_DARK_THRESH (30): the cover blocks the LED
+                                 # outright and reads ~0, while the eye-socket and
+                                 # brow shadow sit around 10-30.  Measured over the
+                                 # Transfers/ captures, dropping 30 -> 8 took the
+                                 # mask from 38% of the frame to 23%, raised the
+                                 # detection rate from 29/46 frames to 43/46, and
+                                 # cut the cases where the band swallows the pupil
+                                 # from 13/29 to 6/43.  Do not raise this.
+_COVER_LIVE_GAP = 6              # consecutive bright rows that end a dark run (so a
+                                 # speck of glare on the cover doesn't cut it short)
+_COVER_LIVE_MIN_DEPTH_FRAC = 0.02  # a column counts as covered past this depth
+_COVER_LIVE_MAX_DEPTH_FRAC = 0.60  # a band deeper than this has fused with the
+                                   # socket shadow — reject rather than mask the eye
+_COVER_LIVE_MIN_COLS_FRAC = 0.20   # need this fraction of columns covered to call it
+_COVER_LIVE_PROFILE_SMOOTH = 15    # median window (px) over the depth profile
+_COVER_LIVE_SPIKE_WIN = 91         # 1-D opening window (px) that shaves narrow deep
+                                   # spikes off the profile.  These happen where the
+                                   # dark PUPIL joins the band through an eyelash, and
+                                   # they matter: guidance.target_point takes the
+                                   # mask's deepest row, so one spike would put the
+                                   # alignment target on the spike tip, not the cover
+_COVER_LIVE_STABLE_FRAMES = 3    # consecutive stable detections before "found"
+_COVER_LIVE_JITTER_FRAC = 0.03   # max centroid movement (frac of min(h,w)) to count
+                                 # as the same, settled cover
+_COVER_LIVE_HOLD_FRAMES = 10     # keep the last good mask this many misses before
+                                 # falling back to the stored calibration
+
+
+def _cover_depth_profile(dark_from_edge):
+    """Per-column depth of the dark run entering from row 0.
+
+    `dark_from_edge` is a boolean (h, w) array already oriented so that row 0 is
+    the frame edge being probed.  A run ends at the first block of
+    `_COVER_LIVE_GAP` consecutive bright rows, so glare specks on the cover do not
+    truncate it.  Returns an int array of length w (depth in px, h if never ends).
+    """
+    h, w = dark_from_edge.shape
+    gap = min(_COVER_LIVE_GAP, h)
+    bright = (~dark_from_edge).astype(np.int32)
+    csum = np.cumsum(bright, axis=0)
+    # Sum over each window of `gap` rows starting at y: rows [y, y+gap).
+    win = csum[gap - 1:, :] - np.vstack([np.zeros((1, w), np.int32),
+                                         csum[:-gap, :]])
+    all_bright = (win == gap)                      # (h-gap+1, w)
+    ends = all_bright.any(axis=0)
+    return np.where(ends, all_bright.argmax(axis=0), h).astype(np.int32)
+
+
+def _open_profile(prof, win):
+    """1-D greyscale opening (rolling min, then rolling max) of a depth profile.
+
+    Removes narrow *deep* excursions — a spike where the dark pupil joins the
+    cover band through an eyelash — while leaving the band's broad shape intact.
+    """
+    w = prof.shape[0]
+    k = max(3, int(win) | 1)
+    if w < k:
+        return prof
+
+    def _roll(a, fn):
+        pad = np.pad(a, k // 2, mode="edge")
+        return fn(np.lib.stride_tricks.sliding_window_view(pad, k), axis=-1)
+
+    return _roll(_roll(prof, np.min), np.max).astype(np.int32)
+
+
+def detect_cover_live(img):
+    """Locate the LED cover on a live frame, without any calibration.
+
+    `img` is BGR or grayscale in DISPLAY orientation.  Returns
+    (mask, side, centroid) — a uint8 mask (255 = cover), "top"/"bottom" for the
+    edge it intrudes from, and its (cx, cy) — or None when nothing qualifies.
+    """
+    if not CV2_AVAILABLE or img is None:
+        return None
+    gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    h, w = gray.shape[:2]
+    dark = gray < _COVER_LIVE_DARK
+
+    min_depth = max(2, int(_COVER_LIVE_MIN_DEPTH_FRAC * h))
+    max_depth = int(_COVER_LIVE_MAX_DEPTH_FRAC * h)
+
+    best = None
+    for side in ("top", "bottom"):
+        prof = _cover_depth_profile(dark if side == "top" else dark[::-1, :])
+        # Smooth the profile so a single stray column cannot spike the outline.
+        # (Rolling median in numpy — cv2.medianBlur only takes 8-bit above k=5, and
+        # these depths run to the frame height.)
+        k = _COVER_LIVE_PROFILE_SMOOTH | 1                 # median needs odd
+        if w >= k:
+            pad = np.pad(prof, k // 2, mode="edge")
+            win = np.lib.stride_tricks.sliding_window_view(pad, k)
+            prof = np.median(win, axis=-1).astype(np.int32)
+        prof = _open_profile(prof, _COVER_LIVE_SPIKE_WIN)  # shave pupil spikes
+        covered = prof >= min_depth
+        if covered.mean() < _COVER_LIVE_MIN_COLS_FRAC:
+            continue
+        depths = prof[covered]
+        if float(np.median(depths)) > max_depth:
+            continue                               # fused with the socket shadow
+        score = float(prof.clip(0, max_depth).sum())
+        if best is None or score > best[0]:
+            best = (score, side, prof)
+    if best is None:
+        return None
+
+    _, side, prof = best
+    prof = np.clip(prof, 0, max_depth)
+    # Paint the band: rows [0, depth) from whichever edge it entered.
+    rows = np.arange(h, dtype=np.int32).reshape(-1, 1)
+    band = rows < prof.reshape(1, -1)
+    if side == "bottom":
+        band = band[::-1, :]
+    mask = (band.astype(np.uint8)) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                  (_COVER_CALIB_DILATE, _COVER_CALIB_DILATE))
+    mask = cv2.dilate(mask, k)                     # grow the soft fuzzy edge
+    if int(cv2.countNonZero(mask)) == 0:
+        return None
+
+    ys, xs = np.where(mask > 0)
+    return mask, side, (float(xs.mean()), float(ys.mean()))
+
+
+class CoverTracker:
+    """Debounce detect_cover_live across frames; fall back to the calibration.
+
+    A single-frame cover mask flickers (the threshold sits right on the cover's
+    soft edge), and the guidance target is derived from it, so the target would
+    jump.  Require the detection to repeat with a settled centroid before
+    reporting `found`, then hold the last good mask through short dropouts.  Only
+    once the hold expires does it fall back to the stored calibration mask, so the
+    calibration-free path is what normally drives the session.
+    """
+
+    def __init__(self):
+        self.mask = None            # last good mask (display coords)
+        self.side = None            # "top" / "bottom"
+        self.centroid = None
+        self.stable = 0             # consecutive settled detections
+        self.misses = 0             # consecutive frames with no detection
+        self.vetoed = 0             # detections thrown out for covering the pupil
+        self.from_calibration = False
+
+    def reset(self):
+        self.__init__()
+
+    @property
+    def found(self):
+        """Cover located and settled (or supplied by the calibration fallback)."""
+        return self.mask is not None and (self.from_calibration
+                                          or self.stable >= _COVER_LIVE_STABLE_FRAMES)
+
+    def update(self, img, pupil_center=None):
+        """Feed one display-orientation frame.  Returns the current mask or None.
+
+        `pupil_center`, when known, is used as a veto: the pupil is dark and can be
+        contiguous with the cover through the lashes, and a band that has run
+        through it is wrong by construction (redeye_extract refuses a pupil sitting
+        on the cover).  Such a detection is treated as a miss, so the session waits
+        for a cleaner frame instead of aligning to a bogus edge.
+        """
+        shape = img.shape[:2]
+        det = detect_cover_live(img)
+        if det is not None and pupil_center is not None:
+            px = int(np.clip(pupil_center[0], 0, shape[1] - 1))
+            py = int(np.clip(pupil_center[1], 0, shape[0] - 1))
+            if det[0][py, px] > 0:
+                det = None
+                self.vetoed += 1
+        if det is not None:
+            mask, side, centroid = det
+            jitter = _COVER_LIVE_JITTER_FRAC * min(shape)
+            settled = (self.centroid is not None
+                       and not self.from_calibration
+                       and float(np.hypot(centroid[0] - self.centroid[0],
+                                          centroid[1] - self.centroid[1])) <= jitter)
+            self.stable = self.stable + 1 if settled else 1
+            self.mask, self.side, self.centroid = mask, side, centroid
+            self.misses = 0
+            self.from_calibration = False
+            return self.mask
+
+        self.misses += 1
+        if self.mask is not None and self.misses <= _COVER_LIVE_HOLD_FRAMES:
+            return self.mask                          # ride out a short dropout
+
+        # Hold expired — fall back to the stored calibration, if there is one.
+        fallback = load_cover_mask(shape)
+        if fallback is not None and int(cv2.countNonZero(fallback)):
+            ys, xs = np.where(fallback > 0)
+            self.mask = fallback
+            self.centroid = (float(xs.mean()), float(ys.mean()))
+            self.side = "top" if self.centroid[1] < shape[0] * 0.5 else "bottom"
+            self.from_calibration = True
+            self.stable = 0
+            return self.mask
+
+        self.mask = self.side = self.centroid = None
+        self.stable = 0
+        self.from_calibration = False
+        return None
+
+    def status(self):
+        """Short status string for the on-screen sub-line."""
+        if self.mask is None:
+            return "cover: searching" + (f" (vetoed {self.vetoed})"
+                                         if self.vetoed else "")
+        src = "calib" if self.from_calibration else "live"
+        return f"cover: {self.side}/{src}" + ("" if self.found
+                                              else f" ({self.stable}/"
+                                                   f"{_COVER_LIVE_STABLE_FRAMES})")
 
 
 # ── Swirski detector (commented out — Orlosky is used instead; see below) ──
@@ -1918,6 +2185,28 @@ def _draw_overlays(bgr, overlays):
     return bgr
 
 
+def draw_redeye_highlight(bgr, mask):
+    """Tint the detected red-eye pixels on a live frame and outline them.
+
+    Cheap enough to run every frame (a boolean tint + one contour pass) — the
+    expensive selection is done by redeye_extract and cached by the caller, so a
+    slightly stale mask is drawn between recomputes rather than recomputing here.
+    """
+    if mask is None or bgr is None or mask.shape[:2] != bgr.shape[:2]:
+        return bgr
+    n = int(cv2.countNonZero(mask))
+    if n == 0:
+        return bgr
+    bgr[mask > 0] = (0.35 * bgr[mask > 0]
+                     + 0.65 * np.array([0, 255, 0])).astype(np.uint8)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(bgr, cnts, -1, (0, 255, 0), 1)
+    for col, th in (((0, 0, 0), 3), ((0, 255, 0), 1)):
+        cv2.putText(bgr, f"redeye {n}px", (10, bgr.shape[0] - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, th, cv2.LINE_AA)
+    return bgr
+
+
 def process_image(array, overlays=None):
 
     img = Image.fromarray(array)
@@ -2161,10 +2450,195 @@ def classify_detection(ridge, ritnet, shape, agree_frac=DETECT_AGREE_FRAC):
 # ───────── RED-EYE / FUNDUS REGION EXTRACTION ─────────
 _REDEYE_ROI_MULT = 1.8          # search radius = this x detected pupil radius
 _REDEYE_ROI_MIN_FRAC = 0.06     # ...but at least this x min(h, w)
-_REDEYE_MIN_SHIFT = 18          # floor on the red-shift score to select a pixel
+_REDEYE_MIN_SHIFT = 24          # floor on the red-shift score to select a pixel.
+                                # Raised from 18.  Measured over the Transfers/
+                                # captures: on-eye selection drops to 68% of its
+                                # former size (harmless — the sweep's peak-finding
+                                # reads relative change, and no capture falls under
+                                # REDEYE_MIN_PX) while the stray red picked up
+                                # with the ROI parked on lit skin goes to ZERO.
+                                # Past ~27 real readings start reading as lost.
 _REDEYE_AMBIENT_DARK = 90       # ambient luma below this = "was dark" (soft prior)
 _REDEYE_AMBIENT_BOOST = 12      # red-shift boost where the pixel read dark in ambient
+_REDEYE_AMBIENT_MAX = 110       # STRICT gate (strict_ambient=True): a fundus pixel is
+                                # inside the pupil, so it MUST read dark in ambient.
+                                # Anything brighter is lit skin/sclera/iris, however
+                                # red it went under the flash.  Speculars (the corneal
+                                # reflection, the one bright thing legitimately inside
+                                # the pupil) are already excluded from the mask, so
+                                # this can be a hard veto rather than a prior.
+                                # This absolute cap is only the backstop — measured on
+                                # the Transfers/ captures it never fires, because the
+                                # ambient frames are dim enough that even lit skin sits
+                                # under it.  The Otsu split below is what discriminates.
+_REDEYE_AMBIENT_OTSU_MIN = 30   # Adaptive veto: split the ambient luma INSIDE the ROI
+                                # (Otsu) and reject the bright side — the pupil is the
+                                # dark population, everything else is lit tissue.  Only
+                                # applied when the split lands above this, i.e. the ROI
+                                # really does contain both populations; a ROI sitting
+                                # wholly inside a dark pupil splits on noise alone and
+                                # would otherwise cull half the genuine fundus.
 _REDEYE_SPECULAR_DILATE = 9     # grow the specular / corneal-reflex exclusion
+
+# ── Pupil-ellipse gating: which connected red group is the real fundus ──
+# Red-shift alone will happily select warm skin, a lid margin or a sclera glint.
+# The fundus reflex, though, can only come back through the pupil — so the kept
+# group must OVERLAP the detected pupil circle, and exactly one group survives.
+_REDEYE_GROUP_OUTER_MULT = 1.6  # keep a qualifying group's pixels out to this x the
+                                # pupil radius: the glow spills a little past the
+                                # detected circle (the fit is imperfect and the pupil
+                                # dilates between frames), but not indefinitely
+_REDEYE_GROUP_MIN_OVERLAP = 8   # px of a group that must fall INSIDE the pupil circle
+                                # for it to qualify at all
+_REDEYE_GROUP_SIMILAR = 0.6     # two groups whose areas are within this ratio count as
+                                # "of similar size", so shape breaks the tie
+_REDEYE_GROUP_DISK_MARGIN = 0.12  # diskness gap that settles a similar-size tie; below
+                                  # it, distance from the pupil centre decides
+
+# ── C-shape / ring rejection ──
+# A real reflex FILLS THE PUPIL IN from one side as the alignment improves, so it
+# is always a solid region: a disc, a half-disc, a D.  A crescent that curls round
+# into a C, or a ring tracing the pupil rim, is the limbus or the cover edge
+# catching the flash, never the fundus.  Two independent tests, because neither
+# catches both failures (measured on reference shapes):
+#
+#     shape                              solidity   contour-fill
+#     full disc                            0.99        1.00
+#     half disc (fills from one side)      0.99        1.00
+#     3/4 disc                             0.82        1.00
+#     thick C (270 deg arc)                0.57        0.99   <- solidity catches
+#     thin C  (240 deg arc)                0.35        0.99   <- solidity catches
+#     full ring                            0.99        0.30   <- fill catches
+#
+# solidity     = area / convex-hull area.  A C's hull bridges its opening.
+# contour-fill = area / area enclosed by the outer contour.  A ring encloses its
+#                own hole, which the hull test cannot see.
+_REDEYE_MIN_SOLIDITY = 0.60     # below this the group has curled into a C.  On the
+                                # Transfers/ captures this rejects 1 of 14 (the
+                                # worst-aligned, solidity 0.58) and clears both
+                                # reference C shapes; 0.55 rejects none of the 14
+_REDEYE_MIN_CONTOUR_FILL = 0.55  # below this the group is a ring/annulus
+
+
+def _group_diskness(xs, ys, area):
+    """How much a pixel group looks like a filled-in disc rather than an arc.
+
+    area / (area of its minimum enclosing circle).  A partially coloured-in circle
+    — what a real fundus reflex looks like — scores high; a highlight running along
+    part of a circumference (an iris/limbus rim or a lid margin catching the flash)
+    encloses a big circle with few pixels in it, so it scores low.
+    """
+    if area <= 0 or len(xs) < 3:
+        return 0.0
+    pts = np.column_stack([xs, ys]).astype(np.float32)
+    (_, _), rad = cv2.minEnclosingCircle(pts)
+    if rad <= 0:
+        return 0.0
+    return float(area) / (math.pi * float(rad) ** 2)
+
+
+def _group_shape(comp_mask, area):
+    """(solidity, contour_fill) for one connected group.
+
+    Both are 1.0 for a solid blob.  Solidity falls when the group curls into a C
+    (its convex hull bridges the opening); contour-fill falls when it is a ring
+    (the outer contour encloses a hole the hull test cannot see).
+    """
+    cnts, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts or area <= 0:
+        return 0.0, 0.0
+    c = max(cnts, key=cv2.contourArea)
+    enclosed = float(cv2.contourArea(c))
+    hull = float(cv2.contourArea(cv2.convexHull(c)))
+    solidity = (enclosed / hull) if hull > 0 else 0.0
+    fill = (float(area) / enclosed) if enclosed > 0 else 0.0
+    return solidity, min(1.0, fill)
+
+
+def select_redeye_group(mask, center, radius):
+    """Reduce a red-shift mask to the ONE connected group that is the fundus reflex.
+
+    A group qualifies only if it overlaps the pupil circle (`center`, `radius`);
+    a qualifying group keeps its pixels out to `_REDEYE_GROUP_OUTER_MULT` x the
+    radius, so a reflex that spills slightly past the fitted circle survives whole
+    while a blob merely touching the pupil cannot drag half the frame in with it.
+
+    Among qualifying groups the choice is, in order:
+      1.  area — the biggest group wins outright unless another is of similar size
+      2.  diskness — of similarly-sized groups, the filled-in disc beats the arc
+      3.  distance — if those are close too, the group centred nearest the pupil
+
+    Returns (mask, note).  The mask is all-zero when nothing qualifies.
+    """
+    if mask is None or center is None or not radius:
+        return mask, ""
+    h, w = mask.shape[:2]
+    cx, cy = float(center[0]), float(center[1])
+    r = float(radius)
+
+    # Trim anything well beyond the pupil before grouping, so a qualifying group
+    # cannot reach out into unrelated warm tissue through a thin bridge.
+    yy, xx = np.ogrid[:h, :w]
+    d2 = (xx - cx) ** 2 + (yy - cy) ** 2
+    outer = d2 <= (_REDEYE_GROUP_OUTER_MULT * r) ** 2
+    work = mask.copy()
+    work[~outer] = 0
+
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(work)
+    if n <= 1:
+        return np.zeros_like(mask), "no red group"
+
+    inside = d2 <= r * r                      # the pupil circle itself
+    cands = []
+    rejected = []
+    for lbl in range(1, n):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        sel = labels == lbl
+        overlap = int(np.count_nonzero(sel & inside))
+        if overlap < _REDEYE_GROUP_MIN_OVERLAP:
+            continue                          # never reaches into the pupil
+        comp = sel.astype(np.uint8) * 255
+        solidity, fill = _group_shape(comp, area)
+        # A genuine reflex fills the pupil in from one side, so it is solid.  A C
+        # or a ring is the limbus/cover rim catching the flash, not the fundus.
+        if solidity < _REDEYE_MIN_SOLIDITY:
+            rejected.append(f"C-shape(sol={solidity:.2f})")
+            continue
+        if fill < _REDEYE_MIN_CONTOUR_FILL:
+            rejected.append(f"ring(fill={fill:.2f})")
+            continue
+        ys, xs = np.nonzero(sel)
+        cands.append({
+            "lbl": lbl, "area": area, "overlap": overlap,
+            "disk": _group_diskness(xs, ys, area),
+            "sol": solidity, "fill": fill,
+            "dist": float(np.hypot(cents[lbl][0] - cx, cents[lbl][1] - cy)),
+        })
+
+    if not cands:
+        why = (" - rejected " + ", ".join(rejected[:3])) if rejected else ""
+        return np.zeros_like(mask), f"no valid red group{why}"
+
+    biggest = max(c["area"] for c in cands)
+    top = [c for c in cands if c["area"] >= _REDEYE_GROUP_SIMILAR * biggest]
+    if len(top) == 1:
+        best = top[0]
+        why = "largest"
+    else:
+        top.sort(key=lambda c: -c["disk"])
+        if top[0]["disk"] - top[1]["disk"] > _REDEYE_GROUP_DISK_MARGIN:
+            best = top[0]
+            why = f"diskness {top[0]['disk']:.2f}"
+        else:
+            best = min(top, key=lambda c: c["dist"])
+            why = f"nearest ({best['dist']:.0f}px)"
+
+    out = np.where(labels == best["lbl"], 255, 0).astype(np.uint8)
+    note = (f"group {best['area']}px disk={best['disk']:.2f} "
+            f"sol={best['sol']:.2f} off={best['dist']:.0f}px [{why}]"
+            + (f" of {len(cands)}" if len(cands) > 1 else "")
+            + (f", {len(rejected)} shape-rejected" if rejected else ""))
+    return out, note
 
 
 @dataclass
@@ -2178,7 +2652,7 @@ class RedeyeResult:
 
 
 def redeye_extract(flash_bgr, dark_bgr, ambient_bgr, center, radius,
-                   cover_mask=None):
+                   cover_mask=None, strict_ambient=False, gate_to_pupil=True):
     """Isolate the flash retroreflection (fundus red-eye) pixels near the pupil.
 
     Selects pixels that shifted most toward red vs the all-off `dark_bgr` (softly
@@ -2224,10 +2698,28 @@ def redeye_extract(flash_bgr, dark_bgr, ambient_bgr, center, radius,
     # Red rose more than blue vs the all-off dark frame == "became reddish".
     redshift = (f[:, :, 2] - d[:, :, 2]) - (f[:, :, 0] - d[:, :, 0])
     warm = f[:, :, 2] > f[:, :, 0]                  # genuinely warm in the flash
+    ambient_ok = None
     if ambient_bgr is not None and ambient_bgr.shape[:2] == (h, w):
         aluma = ambient_bgr.astype(np.int16).mean(axis=2)
         redshift = redshift + np.where(aluma < _REDEYE_AMBIENT_DARK,
                                        _REDEYE_AMBIENT_BOOST, 0)
+        if strict_ambient:
+            # Hard veto: the fundus glow can only come through the pupil, which is
+            # dark under ambient light.  Pairing each flash frame with a FRESH
+            # ambient one is what makes this trustworthy — a stale ambient frame
+            # would be misregistered against a moving eye.
+            #
+            # The cut is adaptive: Otsu over the ambient luma inside the ROI, so it
+            # tracks however bright this particular ambient exposure came out, with
+            # the absolute cap as a backstop.
+            a_thr = float(_REDEYE_AMBIENT_MAX)
+            a_roi = np.clip(aluma[roi > 0], 0, 255).astype(np.uint8)
+            if a_roi.size:
+                a_otsu, _ = cv2.threshold(a_roi.reshape(-1, 1), 0, 255,
+                                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                if float(a_otsu) >= _REDEYE_AMBIENT_OTSU_MIN:
+                    a_thr = min(a_thr, float(a_otsu))
+            ambient_ok = aluma < a_thr
 
     # Adaptive floor from the ROI's red-shift distribution (Otsu), with a fixed min.
     rs_pos = np.clip(redshift, 0, 255).astype(np.uint8)
@@ -2237,7 +2729,10 @@ def redeye_extract(flash_bgr, dark_bgr, ambient_bgr, center, radius,
         otsu, _ = cv2.threshold(roi_vals.reshape(-1, 1), 0, 255,
                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     floor = max(_REDEYE_MIN_SHIFT, float(otsu))
-    mask = ((redshift >= floor) & warm & (roi > 0)).astype(np.uint8) * 255
+    sel = (redshift >= floor) & warm & (roi > 0)
+    if ambient_ok is not None:
+        sel &= ambient_ok
+    mask = sel.astype(np.uint8) * 255
 
     # Exclude corneal reflections / speculars (do NOT inpaint them here).
     fgray = cv2.cvtColor(flash_bgr, cv2.COLOR_BGR2GRAY)
@@ -2253,6 +2748,12 @@ def redeye_extract(flash_bgr, dark_bgr, ambient_bgr, center, radius,
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
 
+    # Keep only the one connected group that belongs to the pupil.  Done AFTER the
+    # morphology so the open/close has already bridged the reflex into one blob.
+    group_note = ""
+    if gate_to_pupil and radius:
+        mask, group_note = select_redeye_group(mask, (cx, cy), r)
+
     roi_area = int(cv2.countNonZero(roi))
     sel_area = int(cv2.countNonZero(mask))
     res.coverage = sel_area / roi_area if roi_area else 0.0
@@ -2267,7 +2768,11 @@ def redeye_extract(flash_bgr, dark_bgr, ambient_bgr, center, radius,
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(overlay, cnts, -1, (0, 255, 0), 1)
     overlay[(spec > 0) & (roi > 0)] = (0, 0, 255)   # excluded speculars, in the ROI
-    cv2.circle(overlay, (cx, cy), roi_r, (255, 255, 0), 1)
+    cv2.circle(overlay, (cx, cy), roi_r, (255, 255, 0), 1)          # search ROI
+    if radius:                                                       # the gate itself
+        cv2.circle(overlay, (cx, cy), int(round(r)), (0, 255, 255), 1)   # pupil
+        cv2.circle(overlay, (cx, cy), int(round(_REDEYE_GROUP_OUTER_MULT * r)),
+                   (0, 140, 200), 1)                                 # spill allowance
     cv2.circle(overlay, (cx, cy), 3, (255, 0, 255), -1)
     for col, th in (((0, 0, 0), 3), ((0, 255, 0), 1)):
         cv2.putText(overlay, f"redeye px={sel_area} cov={res.coverage:.2f}",
@@ -2277,8 +2782,987 @@ def redeye_extract(flash_bgr, dark_bgr, ambient_bgr, center, radius,
     res.mask = mask
     res.overlay = overlay
     res.extract = extract
-    res.notes = f"{sel_area}px in ROI r={roi_r}"
+    res.notes = (f"{sel_area}px in ROI r={roi_r}"
+                 + (f"; {group_note}" if group_note else ""))
     return res
+
+
+# ───────── APPROACH + FIXATION-TARGET SEARCH ─────────
+# Two stages share one idea: the red reflex is the only trustworthy signal, so
+# nothing is predicted — things are moved and the red is measured.
+#
+#   APPROACH  the OPERATOR closes the vertical gap between the LED cover and the
+#             pupil by hand.  We just watch the red pixel count and hand over once
+#             there is a decent chunk of it.
+#   TARGET    the FIXATION TARGET is then walked around the screen by coordinate
+#             hill-climbing (y, then x, then finer).  The patient keeps looking at
+#             it, so their gaze follows wherever it goes.  No direction is guessed:
+#             a probe that lowers the red is simply reversed.
+REDEYE_MIN_PX = 40              # fewer red pixels than this = no usable reflex
+REDEYE_PUPIL_CONF_GATE = 0.20   # min detect_pupil confidence to trust the re-detected
+                                # disc over the ambient-stage radius
+
+APPROACH_GOOD_PX = 800          # "a decent chunk of red eye" — hand over to the
+                                # target search once a measurement reaches this.
+                                # Measured on the Transfers/ captures the gated
+                                # reflex runs 349-2672px (median ~1220), so the
+                                # original 3000 would almost never have been
+                                # reached; 800 is cleared by 11 of those 14
+APPROACH_HOLD = 2               # consecutive measurements at/above it, so a single
+                                # lucky frame does not advance the stage
+APPROACH_TIMEOUT_S = 90.0       # give the operator this long before dropping back
+# Once there IS reflex and the operator has been told to hold, STAY held.  The
+# reflex flickers frame to frame, and dropping straight back to "move down and
+# right" on one weak reading sends the scope hunting again — usually away from
+# the spot that just worked.  Only a sustained collapse releases the latch.
+APPROACH_RELEASE_FRAC = 0.35    # reflex below this share of APPROACH_GOOD_PX...
+APPROACH_RELEASE_TRIES = 4      # ...for this many readings in a row, to release
+
+# ── continuous gaze scan (the target stage) ──
+# The fixation point is swept SMOOTHLY and the reflex recorded the whole way, then
+# the best position is chosen from the profile.  This replaced a probe-and-settle
+# hill-climb, and the lighting is what forced it: probing needed an ambient blip
+# per measurement to re-check the pupil, and every blip re-constricts it.  Under a
+# steadily held flash the pupil stays wide and the eye keeps moving, so the scan
+# is one unbroken sweep with NO ambient or dark switching at all.
+SCAN_SPEED_FRAC_S = 0.30        # fixation-point travel per second, as a fraction
+                                # of min(h, w).  Readings arrive at a fixed rate,
+                                # so travelling 4x faster over the SAME distance
+                                # takes a quarter of the samples — and a quarter
+                                # of the time (~5s, from ~19s).  The profile is
+                                # coarser but the peak is broad, and less time
+                                # staring is worth more than a finer curve.
+# The sweep is deliberately LOPSIDED.  The LED sits behind the cover, so reflex
+# grows as the gaze turns that way and there is a lot of useful travel in that
+# direction; turning away from the cover only ever loses reflex, so a short leg
+# is enough to establish that the peak has been passed.  Side-to-side matters far
+# less than either — set its range to 0 to skip that axis altogether.
+SCAN_RANGE_Y_TOWARD_FRAC = 0.26   # vertical travel TOWARD the cover/LED
+SCAN_RANGE_Y_AWAY_FRAC = 0.09     # ...and away from it
+SCAN_RANGE_X_FRAC = 0.0           # side-to-side (0 = skip the axis entirely)
+SCAN_SETTLE_S = 0.9             # pause before a sweep, and at the chosen best
+SCAN_CONFIRM_FRAMES = 4         # measurements taken at the best before capturing
+SCAN_MIN_SAMPLES = 4            # too few readings on an axis to trust the profile.
+                                # Lowered with the 4x speed-up: the same distance
+                                # now yields a quarter of the samples
+SCAN_SMOOTH = 3                 # median window over the recorded profile — also
+                                # narrowed, or it would span most of the profile
+SCAN_DROPOUT_TRIES = 12         # consecutive empty readings before giving up.
+                                # Higher than the paced stages: readings now come
+                                # every frame, so a blink alone is several of them
+
+# Banking mosaic material DURING the search.  Every measurement whose reflex is
+# confidently inside the pupil is worth keeping — the gaze is being walked around,
+# so consecutive measurements see genuinely different parts of the fundus, which
+# is precisely what the mosaic needs.  "Confidently in the pupil" means: the
+# measurement was valid (so the group already overlapped the pupil and passed the
+# C-shape/ring tests), it is a decent size, and the pupil disc was actually
+# re-detected rather than falling back to the stale ambient radius.
+SESSION_SAVE_MIN_PX = 500       # smaller than this is not worth stitching
+SESSION_SAVE_GAP_S = 0.8        # min seconds between saved frames
+SESSION_SAVE_REQUIRE_DISC = True  # require source == "redetect"
+
+
+# ───────── BLINK DETECTION ─────────
+# A blink ruins every measurement it touches: the lid covers the pupil, so the
+# red reflex vanishes, pupil detection lands on a lid crease, and the guidance
+# either chases a phantom or counts the frame as "reflex lost" and gives up.  The
+# frames either side are just as bad — the lid is mid-sweep.
+#
+# Two cues, because neither alone is trustworthy here:
+#
+#  1. LOST PUPIL.  A lid across the pupil breaks the ambient dark-disc fit, and
+#     that needs no photometric calibration at all — it is the same detector the
+#     rest of the pipeline already relies on.  This is the primary cue.
+#
+#  2. NOTHING BLACK LEFT.  The pupil is dark in EVERY channel; lit skin is bright
+#     in red.  So the darkest tenth of the per-pixel channel MAXIMUM, in a tight
+#     ROI, jumps when a lid covers the pupil.  Measured over the Transfers/
+#     frames with a synthetic lid: ~15 open, ~49 covered.  Grayscale is useless
+#     for this — under violet/red light a saturated-red cheek maps to ~60 gray
+#     and reads as "dark" alongside the pupil.
+#
+# Cue 2 is corroboration, not a gate: validated only against a SYNTHETIC lid (no
+# real blink footage exists yet), it caught 28/46 full closures and no partial
+# ones, largely because pasted "skin" is often shadow in these frames.  The live
+# number is printed in the status line so it can be calibrated from one real
+# session — raise BLINK_RISE_FACTOR if real blinks are being missed.
+BLINK_DARK_PCTILE = 10          # percentile of the max-channel that tracks the
+                                # blackest part of the pupil
+BLINK_ROI_MULT = 1.2            # measure within this x the pupil radius
+BLINK_ROI_MIN_FRAC = 0.05       # ...but at least this x min(h, w)
+BLINK_RISE_FACTOR = 1.6         # darkest-tenth rising this much above baseline
+BLINK_RISE_MIN = 6.0            # ...and by at least this many levels
+BLINK_HOLD_FRAMES = 2           # keep distrusting cycles this long afterwards —
+                                # the lid is still moving as it reopens
+BLINK_WARMUP = 4                # samples before the baseline means anything
+BLINK_BASELINE_N = 12           # running-median window over open frames
+BLINK_MAX_CONSEC = 6            # after this many cycles blamed on blinking, stop
+                                # excusing them: an eye that is shut, absent or
+                                # simply lost is NOT a blink, and must be allowed
+                                # to reach the normal lost-reflex path instead of
+                                # stalling the search for ever
+
+
+class BlinkDetector:
+    """Flags cycles a blink may have spoiled, so the red-eye stages can skip them.
+
+    `update()` takes the AMBIENT frame of a cycle plus the pupil-detection result
+    already computed from it, and returns True while the cycle is suspect — during
+    the blink and for BLINK_HOLD_FRAMES after.  The baseline only learns from
+    frames judged open, so a long closure cannot drag it down and normalise itself.
+    """
+
+    def __init__(self):
+        self.hist = []              # darkest-tenth values of recent OPEN frames
+        self.hold = 0               # cycles still distrusted after a blink
+        self.consec = 0             # consecutive cycles blamed on blinking
+        self.baseline = None
+        self.last = 0.0             # most recent darkest-tenth value
+        self.blinks = 0             # completed blinks this session
+        self.why = ""               # which cue fired, for the status line
+
+    def reset(self):
+        self.__init__()
+
+    def _darkest(self, bgr, center, radius):
+        """Darkest tenth of the per-pixel channel maximum, in a tight ROI."""
+        h, w = bgr.shape[:2]
+        r = int(max(BLINK_ROI_MULT * float(radius or 0),
+                    BLINK_ROI_MIN_FRAC * min(h, w)))
+        cx, cy = ((w // 2, h // 2) if center is None
+                  else (int(center[0]), int(center[1])))
+        roi = bgr[max(0, cy - r):min(h, cy + r), max(0, cx - r):min(w, cx + r)]
+        if roi.size == 0:
+            return 255.0
+        chan_max = roi.max(axis=2) if roi.ndim == 3 else roi
+        return float(np.percentile(chan_max, BLINK_DARK_PCTILE))
+
+    def update(self, bgr, center=None, radius=None, pupil_found=True,
+               pupil_conf=1.0):
+        """Feed one cycle's ambient frame + its pupil result.  True => distrust."""
+        if bgr is None:
+            return self.hold > 0
+        self.last = self._darkest(bgr, center, radius)
+        lost = (not pupil_found) or pupil_conf < SWEEP_TRACK_CONF
+
+        warming = self.baseline is None or len(self.hist) < BLINK_WARMUP
+        risen = (not warming
+                 and self.last > max(self.baseline * BLINK_RISE_FACTOR,
+                                     self.baseline + BLINK_RISE_MIN))
+
+        if (lost or risen) and self.consec < BLINK_MAX_CONSEC:
+            if self.hold == 0:
+                self.blinks += 1
+            self.why = "pupil lost" if lost else "nothing black left"
+            self.hold = BLINK_HOLD_FRAMES
+            self.consec += 1
+            return True
+
+        if self.hold > 0 and self.consec < BLINK_MAX_CONSEC:
+            self.hold -= 1          # reopening — still not trustworthy
+            self.consec += 1
+            return True
+
+        # Open (or we have run out of patience and must stop blaming blinks).
+        self.hold = 0
+        self.consec = 0
+        self.why = ""
+        if not lost:
+            self.hist.append(self.last)     # learn only from open frames
+            if len(self.hist) > BLINK_BASELINE_N:
+                self.hist.pop(0)
+            self.baseline = float(np.median(self.hist))
+        return False
+
+    @property
+    def suspect(self):
+        return self.hold > 0
+
+    def status(self):
+        if self.baseline is None or len(self.hist) < BLINK_WARMUP:
+            return f"blink: learning dark={self.last:.0f}"
+        rel = self.last / self.baseline if self.baseline else 0.0
+        tag = f"SUSPECT({self.why})" if self.hold else "ok"
+        return (f"blink: {tag} dark={self.last:.0f}/{self.baseline:.0f} "
+                f"x{rel:.2f} n={self.blinks}")
+TARGET_MARGIN_FRAC = 0.12       # keep the target this far inside the frame edges —
+                                # a fixation point in the corner is unusable
+TARGET_INVERT_X = True          # The patient sees the fixation point MIRRORED
+                                # left-to-right, so to send their gaze left the
+                                # point has to be drawn to the right.  Applied only
+                                # where the offset becomes a screen position — the
+                                # search itself is a blind hill-climb, so the sign
+                                # convention of its internal offset never matters,
+                                # but where the dot is actually painted does.
+
+# Stages that run the flash/ambient lighting cycle (rather than plain ambient).
+# The streaming loop keys several decisions off this: it skips its own pupil
+# detection, keeps the red-eye highlight alive across the ambient blip, and lets
+# the stage rather than the operator drive both LEDs.
+_LIT_STAGES = ((guidance.STAGE_APPROACH, guidance.STAGE_TARGET)
+               if guidance is not None else ())
+
+# Each measurement is a PAIR of frames: a brief ambient blip, then back to flash.
+# The ambient companion is what proves a red patch is really fundus (it has to read
+# dark there), and refreshing it every measurement keeps it registered against an
+# eye that is deliberately moving.  The flash stays on the rest of the time — it is
+# the patient's fixation target, and every ambient blip re-constricts the pupil.
+SWEEP_LED_SETTLE_S = 0.15       # after flipping the LEDs, let the exposure catch up
+                                # (~4-5 frames at 30fps, so stale buffered frames
+                                # from the previous lighting state are gone)
+SWEEP_DARK_S = 0.35             # ALL-OFF pause between the ambient blip and the
+                                # flash frame.  The ambient light constricts the
+                                # pupil, so measuring straight afterwards reads a
+                                # smaller reflex than the alignment deserves; this
+                                # lets it re-open.  The frame at the end of the
+                                # pause also REFRESHES the dark reference, keeping
+                                # the subtraction registered with a moving eye.
+SWEEP_FLASH_S = 0.45            # flash dwell before the measured frame — longer
+                                # than a bare LED settle so the retina is fully lit
+                                # and the reflex has reached its steady size
+SWEEP_RETRY_S = 0.4             # spacing between retries after an empty measurement.
+                                # Without this the retries fire on consecutive fresh
+                                # frames and a whole budget is gone in ~2s
+SWEEP_LOST_TRIES = 4            # consecutive empty measurements before giving up on
+                                # the red reflex and dropping back to centring.  The
+                                # approach stage does NOT use this — it has its own,
+                                # far more patient budget (APPROACH_TIMEOUT_S), since
+                                # at that point there is genuinely no reflex yet.
+
+# Sanity check run on each fresh ambient frame: a CONFIDENT pupil found far from
+# where the stage thinks it is means the red-eye ROI is parked on the wrong thing.
+# Only a high-confidence ambient detection is trusted here — that is the reliable
+# measurement (properly lit, dark-disc contrast), unlike the flash-lit re-detection.
+SWEEP_AMBIENT_CONF = 0.45       # "very high confidence" ambient pupil
+SWEEP_TRACK_CONF = 0.25         # lower bar for merely FOLLOWING the pupil with the
+                                # ROI.  Both lit stages move the eye on purpose, so
+                                # a slightly-uncertain new position beats holding a
+                                # confidently stale one — and the group gate
+                                # (pupil overlap + shape) rejects the ROI landing
+                                # anywhere daft, so loose tracking is safe now.
+# NOTE: ending a lit stage is RED-EYE-DRIVEN ONLY.  There used to be a second exit
+# that aborted when the re-detected pupil drifted sideways, but under flash-only
+# light that pupil position is the least trustworthy thing on the frame — it is
+# exactly the measurement that falls back to the ambient radius — so it was ending
+# runs the red signal said were fine.  The red reflex alone decides.
+
+
+def measure_red_fraction(flash_bgr, dark_bgr, center, radius, cover_mask=None,
+                         ambient_bgr=None):
+    """How much of the pupil is filled by the flash retroreflection, in [0, 1.5].
+
+    `ambient_bgr` is the FRESH ambient companion frame grabbed moments before the
+    flash frame.  When given it is applied as a hard veto (`strict_ambient`): a
+    real fundus pixel lies inside the pupil, so it must read dark under ambient
+    light; anything brighter is lit tissue that merely went red under the flash.
+
+    Two steps, per the design:
+      1.  ``redeye_extract`` selects the red (fundus) pixels around `center`.
+      2.  Those pixels are painted BLACK on the flash frame and ``detect_pupil``
+          is re-run on the result — with the glow removed the pupil is a plain
+          dark disc again, so its area can be measured and the red pixels
+          expressed as a fraction of it.
+
+    Step 2 is the fragile half: under flash-only light the whole eye is near-black
+    and the disc boundary may not survive.  When the re-detection fails or comes
+    back unconfident we fall back to the `radius` measured during the ambient
+    centring stage, and say so in the returned `source` so a sweep that never gets
+    a real disc is visible rather than silently degraded.
+
+    Returns a dict: fraction, red_px, center (possibly updated), radius, source,
+    valid, notes, mask (the selected red pixels, for the live highlight).
+    """
+    out = {"fraction": 0.0, "red_px": 0, "center": center, "radius": radius,
+           "source": "none", "valid": False, "notes": "", "mask": None,
+           "extract": None}
+    if not CV2_AVAILABLE or flash_bgr is None or dark_bgr is None or center is None:
+        out["notes"] = "frames/centre unavailable"
+        return out
+
+    redeye = redeye_extract(flash_bgr, dark_bgr, ambient_bgr, center, radius,
+                            cover_mask, strict_ambient=ambient_bgr is not None)
+    if not redeye.valid or redeye.mask is None:
+        out["notes"] = redeye.notes
+        return out
+    red_px = int(cv2.countNonZero(redeye.mask))
+    out["red_px"] = red_px
+    out["mask"] = redeye.mask                      # shown by the live highlight
+    out["extract"] = redeye.extract                # kept for the session mosaic
+    if red_px < REDEYE_MIN_PX:
+        out["notes"] = f"only {red_px}px red"
+        return out
+
+    # Red -> black, then re-detect the pupil as a dark disc.
+    blanked = flash_bgr.copy()
+    blanked[redeye.mask > 0] = 0
+    gray = cv2.cvtColor(blanked, cv2.COLOR_BGR2GRAY)
+    detect_pupil(gray, live=True)                  # stashes _LAST_PUPIL/_LAST_CONF
+    if _LAST_PUPIL is not None and _LAST_CONF >= REDEYE_PUPIL_CONF_GATE:
+        pcx, pcy, pr = _LAST_PUPIL
+        out["center"] = (float(pcx), float(pcy))   # follow the rotating eye
+        out["radius"] = float(pr)
+        out["source"] = "redetect"
+    elif radius:
+        pr = float(radius)
+        out["source"] = "ambient-r"                # fell back to the centring radius
+    else:
+        out["notes"] = "no pupil disc and no fallback radius"
+        return out
+
+    pupil_area = math.pi * float(pr) ** 2
+    if pupil_area <= 0:
+        out["notes"] = "degenerate pupil area"
+        return out
+    out["fraction"] = float(min(1.5, red_px / pupil_area))
+    out["valid"] = True
+    out["notes"] = f"{red_px}px / r={pr:.1f} ({out['source']})"
+    return out
+
+
+class LitStage:
+    """Shared lighting cycle for the flash-lit stages (approach and target search).
+
+    Each measurement is an ambient / dark / flash TRIPLE, so a red patch can be
+    checked against a FRESH ambient frame (the fundus must read dark there) and
+    measured on a pupil the ambient light has not just constricted:
+
+        DWELL   (flash lit — the fixation target; operator moving, or gaze settling)
+          -> AMBIENT (brief blip; the loop grabs the ambient companion and reads
+                      the pupil off it)
+          -> DARK    (all off; the pupil re-opens after the ambient blip and the
+                      loop refreshes the dark subtraction reference)
+          -> FLASH   (longer dwell so the reflex reaches full size, then the loop
+                      grabs the frame and measures)
+          -> next sample (AMBIENT) or, once the samples are in, DWELL
+
+    All waiting is against wall-clock deadlines polled from the streaming loop —
+    never time.sleep — so the feed keeps rendering and 's' still aborts.
+    """
+
+    PHASE_DWELL = "dwell"
+    PHASE_AMBIENT = "ambient"
+    PHASE_DARK = "dark"
+    PHASE_FLASH = "flash"
+
+    def __init__(self, dwell_s):
+        self.phase = self.PHASE_DWELL
+        self.deadline = time.time() + dwell_s
+        self.done = False               # advance to the next stage
+        self.abort = ""                 # non-empty => drop back to centring
+        self.spoiled = False            # a blink touched this cycle: throw it away
+        self.spoiled_n = 0              # cycles discarded to blinks
+
+    def lighting(self):
+        """Which LEDs should be lit right now: "ambient", "off" or "flash"."""
+        if self.phase == self.PHASE_AMBIENT:
+            return "ambient"
+        if self.phase == self.PHASE_DARK:
+            return "off"
+        return "flash"                  # dwell and the measured frame alike
+
+    def ready(self):
+        return time.time() >= self.deadline
+
+    def to_ambient(self, delay=SWEEP_LED_SETTLE_S):
+        self.phase = self.PHASE_AMBIENT
+        self.deadline = time.time() + delay
+
+    def to_dark(self, delay=SWEEP_DARK_S):
+        self.phase = self.PHASE_DARK
+        self.deadline = time.time() + delay
+
+    def to_flash(self, delay=SWEEP_FLASH_S):
+        self.phase = self.PHASE_FLASH
+        self.deadline = time.time() + delay
+
+    def to_dwell(self, delay):
+        self.phase = self.PHASE_DWELL
+        self.deadline = time.time() + delay
+
+
+class ApproachState(LitStage):
+    """Watches the red reflex while the OPERATOR closes the gap by hand.
+
+    Nothing is driven from here — the operator moves the scope so the pupil
+    approaches the LED-cover edge, and this just reports the red pixel count and
+    hands over once there is a decent chunk of it (APPROACH_GOOD_PX, held for
+    APPROACH_HOLD measurements so one lucky frame cannot advance the stage).
+    """
+
+    def __init__(self, cover_side, pupil_center, pupil_radius):
+        super().__init__(SWEEP_LED_SETTLE_S)
+        self.cover_side = cover_side
+        self.center = pupil_center
+        self.radius0 = pupil_radius
+        self.red_px = 0
+        self.best_px = 0
+        self.good = 0                   # consecutive measurements at/above target
+        self.held = False               # latched "hold steady" (see APPROACH_RELEASE_*)
+        self.low = 0                    # consecutive readings well below target
+        self.tracked = 0                # times the ROI followed the ambient pupil
+        self.started = time.time()
+
+    def submit(self, meas):
+        """Feed one measurement; sets `done` once the reflex is strong enough."""
+        self.red_px = meas["red_px"]
+        self.best_px = max(self.best_px, self.red_px)
+        if meas["valid"] and meas["center"] is not None:
+            self.center = meas["center"]
+            if meas["radius"]:
+                self.radius0 = meas["radius"]
+        if self.red_px >= APPROACH_GOOD_PX:
+            self.good += 1
+            self.held = True            # latch: stop asking for camera movement
+            self.low = 0
+            if self.good >= APPROACH_HOLD:
+                self.done = True
+                return True
+        else:
+            self.good = 0
+            if self.red_px < APPROACH_RELEASE_FRAC * APPROACH_GOOD_PX:
+                self.low += 1
+                if self.low >= APPROACH_RELEASE_TRIES:
+                    self.held = False   # sustained collapse: guide again
+                    self.low = 0
+            else:
+                self.low = 0            # still respectable; keep holding
+        if time.time() - self.started > APPROACH_TIMEOUT_S:
+            self.abort = (f"no decent red reflex in {APPROACH_TIMEOUT_S:.0f}s "
+                          f"(best {self.best_px}px)")
+            return True
+        self.to_ambient()               # keep cycling
+        return False
+
+    def check_ambient_pupil(self, center, conf, frame_shape):
+        """Follow the pupil on every ambient frame.
+
+        The operator is moving the scope, so the pupil is travelling across the
+        frame the whole time; the ROI has to keep up or the next measurement is
+        taken over stale coordinates."""
+        if center is None or conf < SWEEP_TRACK_CONF:
+            return
+        self.center = (float(center[0]), float(center[1]))
+        self.tracked += 1
+
+    def hint(self):
+        return guidance.approach_hint(self.cover_side, self.red_px, APPROACH_GOOD_PX)
+
+    def camera_hint(self, frame_shape, anchor):
+        """Which way to move the scope: keep closing on the cover edge, and
+        correct any sideways drift off the target column.
+
+        Once there IS enough reflex, stop asking for more travel and call for the
+        scope to be held — that steadiness is what the gaze scan hands over into,
+        and it must begin before the operator has drifted past the sweet spot.
+        """
+        if self.held:
+            return "Camera: hold steady - reflex found"
+        return guidance.camera_hint(self.center, anchor, frame_shape,
+                                    close_to=self.cover_side)
+
+    def camera_vector(self, frame_shape, anchor):
+        """The same instruction as an arrow — where the camera centre should end up."""
+        if self.held:
+            return None                 # holding: no arrow to chase
+        return guidance.camera_arrow(self.center, anchor, frame_shape,
+                                     close_to=self.cover_side)
+
+    def worth_saving(self, meas):
+        """Is this measurement good enough to bank for the mosaic?  (Never here.)
+
+        The approach stage is the operator hunting for the reflex at all, so its
+        frames are half-aligned by definition; banking them would fill the session
+        with material the mosaic cannot use.  Only the target search saves.
+        """
+        return False
+
+    def status(self):
+        return (f"approach: red {self.red_px}px (best {self.best_px}) "
+                f"{self.good}/{APPROACH_HOLD}"
+                + (f" HELD(-{self.low})" if self.held else "")
+                + f" trk={self.tracked}")
+
+
+class GazeScan(LitStage):
+    """Sweeps the fixation point continuously and picks the best gaze direction.
+
+    Runs under a STEADILY HELD FLASH — no ambient blip, no dark pause, no lighting
+    changes of any kind once it starts.  That is the whole reason it is a sweep
+    rather than a series of probes: each ambient blip re-constricts the pupil and
+    costs reflex, so the previous probe-and-settle scheme was fighting itself.
+
+    One axis at a time (y first, then a short x).  The point travels to one end of
+    its range and back to the other, recording the reflex on every frame, and the
+    axis is then parked at the profile's peak.  Nothing is predicted — the peak is
+    simply read off what was measured.
+
+    The vertical sweep is LOPSIDED and much longer than the horizontal one: the
+    LED is behind the cover, so there is real reflex to be gained by turning the
+    gaze that way, while turning away from it only loses reflex and needs just
+    enough travel to show the peak has been passed.
+
+    Consequences of dropping the ambient frames, accepted deliberately:
+      * no fresh ambient companion, so redeye_extract's strict-ambient veto is
+        off here; the pupil-overlap and C-shape/ring gates still apply
+      * no fresh dark reference — the one from the approach stage is reused
+      * the pupil is tracked from the flash-frame re-detection alone
+    """
+
+    MODE_SETTLE = "settle"
+    MODE_SWEEP = "sweep"
+    MODE_RETURN = "return"      # travelling BACK to the peak, never jumping to it
+    MODE_CONFIRM = "confirm"
+
+    def __init__(self, base_target, pupil_center, pupil_radius, frame_shape,
+                 cover_side=None):
+        super().__init__(SCAN_SETTLE_S)
+        h, w = frame_shape[:2]
+        self.shape = (h, w)
+        self.cover_side = cover_side
+        self.base = (float(base_target[0]), float(base_target[1]))
+        self.offset = [0.0, 0.0]
+        self.center = pupil_center
+        self.hold = pupil_center if pupil_center is not None else base_target
+        self.radius0 = pupil_radius
+        scale = float(min(h, w))
+        self.speed = SCAN_SPEED_FRAC_S * scale
+        self.rng_y_toward = SCAN_RANGE_Y_TOWARD_FRAC * scale
+        self.rng_y_away = SCAN_RANGE_Y_AWAY_FRAC * scale
+        self.rng_x = SCAN_RANGE_X_FRAC * scale
+        self.margin = TARGET_MARGIN_FRAC * scale
+
+        # y first: that is the axis the LED sits on, so it carries most of the
+        # reflex variation.  Sweep toward the LED first (see cover_side).
+        self.axes = [1, 0]
+        self.axis_i = 0
+        self.axis = self.axes[0]
+        self.leg = 0                    # 0 = to the first end, 1 = to the other
+        self.dir = -1 if guidance.cover_edge_word(cover_side) == "top" else 1
+        self.origin = 0.0               # offset on this axis when the sweep began
+        self.profile = []               # (offset_on_axis, red_px) this axis
+        self.mode = self.MODE_SETTLE
+        self.return_to = 0.0            # peak this axis is travelling back to
+        self.t_last = time.time()
+
+        self.best_px = 0
+        self.best_offset = [0.0, 0.0]
+        self.best_center = pupil_center
+        self.best_radius = pupil_radius
+        self.confirm = []
+        self.dropouts = 0
+        self.samples_n = 0
+        self.saved = 0
+        self.last_save = 0.0
+        self.last_px = 0
+        self.cam_settled = False
+        self.tracked = 0
+
+    # ── lighting: flash, always ──
+    def lighting(self):
+        return "flash"
+
+    def target(self, offset=None):
+        """Fixation point in display coords (x mirrored — see TARGET_INVERT_X)."""
+        o = self.offset if offset is None else offset
+        h, w = self.shape
+        ox = -o[0] if TARGET_INVERT_X else o[0]
+        return (int(round(min(w - self.margin, max(self.margin, self.base[0] + ox)))),
+                int(round(min(h - self.margin, max(self.margin, self.base[1] + o[1])))))
+
+    def _offset_limits(self, axis):
+        """(lo, hi) offsets on `axis` whose fixation point is still on screen.
+
+        Without this the offset could keep running past the frame while the drawn
+        point sticks at the margin — the profile would then record several
+        different offsets for one actual gaze position.
+        """
+        h, w = self.shape
+        if axis == 1:
+            return (self.margin - self.base[1], (h - self.margin) - self.base[1])
+        if TARGET_INVERT_X:                 # drawn x = base - offset
+            return (self.base[0] - (w - self.margin), self.base[0] - self.margin)
+        return (self.margin - self.base[0], (w - self.margin) - self.base[0])
+
+    def _range_for_axis(self, axis):
+        """Largest travel this axis will ask for (0 => the axis is disabled)."""
+        return max(self.rng_y_toward, self.rng_y_away) if axis == 1 else self.rng_x
+
+    def _range_for_leg(self):
+        """How far this leg travels — vertical is lopsided toward the cover."""
+        if self.axis == 1:
+            return self.rng_y_toward if self.leg == 0 else self.rng_y_away
+        return self.rng_x
+
+    def _end_for_leg(self):
+        """Where this leg of the sweep finishes, on the active axis."""
+        sign = self.dir if self.leg == 0 else -self.dir
+        end = self.origin + sign * self._range_for_leg()
+        lo, hi = self._offset_limits(self.axis)
+        return max(lo, min(hi, end))
+
+    def _advance_point(self, dt):
+        """Move the fixation point along the current leg; True when it arrives."""
+        end = self._end_for_leg()
+        cur = self.offset[self.axis]
+        step = self.speed * dt
+        if abs(end - cur) <= step:
+            self.offset[self.axis] = end
+            return True
+        self.offset[self.axis] = cur + math.copysign(step, end - cur)
+        return False
+
+    def _finish_axis(self):
+        """Pick this axis's peak and start travelling BACK to it.
+
+        The point is never teleported: a jump loses the patient's gaze, which is
+        the one thing a smooth sweep exists to avoid.  MODE_RETURN walks it there
+        at scan speed instead.
+        """
+        if len(self.profile) >= SCAN_MIN_SAMPLES:
+            pos = np.array([p[0] for p in self.profile], float)
+            val = np.array([p[1] for p in self.profile], float)
+            k = min(SCAN_SMOOTH | 1, len(val) if len(val) % 2 else len(val) - 1)
+            if k >= 3:                  # median-smooth: single frames are noisy
+                pad = np.pad(val, k // 2, mode="edge")
+                val = np.median(np.lib.stride_tricks.sliding_window_view(pad, k),
+                                axis=-1)
+            j = int(np.argmax(val))
+            self.return_to = float(pos[j])
+            self.best_px = max(self.best_px, int(val[j]))
+        else:
+            self.return_to = self.origin             # nothing usable; put it back
+
+        self.profile = []
+        self.mode = self.MODE_RETURN
+
+    def _next_axis(self):
+        """Called once the point has arrived back at this axis's peak."""
+        self.best_offset = list(self.offset)
+        self.axis_i += 1
+        # Skip any axis given a zero range — that is how side-to-side is turned
+        # off, and sweeping it would otherwise burn a settle for nothing.
+        while (self.axis_i < len(self.axes)
+               and self._range_for_axis(self.axes[self.axis_i]) <= 0.0):
+            self.axis_i += 1
+        if self.axis_i >= len(self.axes):
+            self.mode = self.MODE_CONFIRM
+            self.deadline = time.time() + SCAN_SETTLE_S
+            return
+        self.axis = self.axes[self.axis_i]
+        self.leg = 0
+        self.dir = 1                    # x has no preferred side
+        self.origin = self.offset[self.axis]
+        self.mode = self.MODE_SETTLE
+        self.deadline = time.time() + SCAN_SETTLE_S
+
+    def tick(self):
+        """Advance the fixation point.  Called on EVERY loop iteration.
+
+        Motion is deliberately separate from measurement: measurements only
+        happen every _LIVE_DETECT_SKIP-th frame, and driving the point from those
+        made it lurch ~6px at 6Hz instead of gliding.  The patient has to be able
+        to follow it, so it moves at display frame rate.
+        """
+        now = time.time()
+        dt = max(0.0, min(0.2, now - self.t_last))
+        self.t_last = now
+
+        if self.mode == self.MODE_SETTLE:
+            if now >= self.deadline:
+                self.origin = self.offset[self.axis]
+                self.mode = self.MODE_SWEEP
+        elif self.mode == self.MODE_SWEEP:
+            if self._advance_point(dt):
+                if self.leg == 0:
+                    self.leg = 1        # turn round and sweep the other way
+                else:
+                    self._finish_axis()
+        elif self.mode == self.MODE_RETURN:
+            cur = self.offset[self.axis]
+            step = self.speed * dt
+            if abs(self.return_to - cur) <= step:
+                self.offset[self.axis] = self.return_to
+                self._next_axis()
+            else:
+                self.offset[self.axis] = cur + math.copysign(
+                    step, self.return_to - cur)
+
+    def submit(self, meas):
+        """Record one measurement.  Called on fresh frames; does not move the point."""
+        now = time.time()
+
+        if not meas["valid"]:
+            self.dropouts += 1
+            self.last_px = 0
+            if self.dropouts >= SCAN_DROPOUT_TRIES:
+                self.abort = f"red reflex lost ({meas['notes']})"
+            return False                # a dropout records nothing
+        self.dropouts = 0
+        self.last_px = meas["red_px"]
+        self.samples_n += 1
+        if meas["center"] is not None:
+            self.center = meas["center"]
+            self.tracked += 1
+        if meas["radius"]:
+            self.radius0 = meas["radius"]
+
+        if self.mode in (self.MODE_SETTLE, self.MODE_RETURN):
+            return False                # tick() handles the motion; nothing to log
+
+        if self.mode == self.MODE_CONFIRM:
+            self.confirm.append((meas["red_px"], meas["center"], meas["radius"]))
+            if now >= self.deadline and len(self.confirm) >= SCAN_CONFIRM_FRAMES:
+                px = sorted(c[0] for c in self.confirm)
+                med = px[len(px) // 2]
+                pick = min(self.confirm, key=lambda c: abs(c[0] - med))
+                self.best_px = max(self.best_px, int(med))
+                self.best_center, self.best_radius = pick[1], pick[2]
+                self.done = True
+            return self.done
+
+        # MODE_SWEEP — record where the point is and how much reflex there is.
+        self.profile.append((self.offset[self.axis], float(meas["red_px"])))
+        return False
+
+    def worth_saving(self, meas):
+        """Bank confident reflexes as the sweep goes — see SESSION_SAVE_*."""
+        if not meas["valid"] or meas["extract"] is None:
+            return False
+        if meas["red_px"] < SESSION_SAVE_MIN_PX:
+            return False
+        if SESSION_SAVE_REQUIRE_DISC and meas["source"] != "redetect":
+            return False
+        now = time.time()
+        if now - self.last_save < SESSION_SAVE_GAP_S:
+            return False
+        self.last_save = now
+        self.saved += 1
+        return True
+
+    def check_ambient_pupil(self, center, conf, frame_shape):
+        """Unused here — this stage never lights the ambient LEDs."""
+        return
+
+    def camera_hint(self, frame_shape):
+        text = guidance.camera_hint(self.center, self.hold, frame_shape,
+                                    settled=self.cam_settled)
+        self.cam_settled = "hold steady" in text
+        return text
+
+    def status(self):
+        ax = "y" if self.axis else "x"
+        if self.mode == self.MODE_SWEEP:
+            span = self._end_for_leg() - self.offset[self.axis]
+            where = f"sweep {ax} leg{self.leg + 1} {span:+.0f}px to go"
+        elif self.mode == self.MODE_RETURN:
+            where = f"returning {ax} to peak"
+        elif self.mode == self.MODE_CONFIRM:
+            where = f"confirming ({len(self.confirm)}/{SCAN_CONFIRM_FRAMES})"
+        else:
+            where = f"settling before {ax}"
+        return (f"scan: {where} red={self.last_px}px best={self.best_px}px "
+                f"n={self.samples_n} saved={self.saved}")
+
+
+# ───────── SESSION GROUPING (for red-eye mosaicing) ─────────
+# One streaming session = one eye alignment run = one group of captures whose
+# red-eye extracts can be stitched into a wider fundus view.  Each take's RAW
+# extract (isolated pixels on black, NOT the green highlight overlay) and its mask
+# are written under LOCAL_SESSION_DIR/session_<stamp>/, and the same pair is
+# uploaded so the receiver can group them too.
+LOCAL_SESSION_DIR = "/tmp/eyevu_sessions"
+SESSION_MIN_FOR_MOSAIC = 2       # takes needed before a mosaic can be built
+
+
+def session_dir(session):
+    """Local directory holding one session's red-eye extracts."""
+    return os.path.join(LOCAL_SESSION_DIR, f"session_{session}")
+
+
+def session_shots(session):
+    """Paths of this session's saved extracts, in capture order."""
+    d = session_dir(session)
+    if not os.path.isdir(d):
+        return []
+    return sorted(os.path.join(d, f) for f in os.listdir(d)
+                  if f.startswith("redeye_") and f.endswith("_extract.png"))
+
+
+def save_session_redeye(session, redeye):
+    """Write one CAPTURE's raw red-eye extract + mask into the session folder."""
+    if not (redeye is not None and redeye.valid):
+        return None
+    return save_session_frame(session, redeye.extract, redeye.mask)
+
+
+def save_session_frame(session, extract, mask):
+    """Write one red-eye extract + mask into the session folder.
+
+    The EXTRACT is saved, not the overlay: the mosaic needs the actual fundus
+    pixels on black, and the highlight tint would poison feature matching.
+
+    Used both by the final capture and — during the target search — by every
+    measurement whose reflex is confidently inside the pupil, so a session
+    accumulates many overlapping views of the fundus instead of just one per
+    take.  That is exactly the material the mosaic wants.
+    Returns the extract's path, or None.
+    """
+    if not CV2_AVAILABLE or extract is None or mask is None:
+        return None
+    d = session_dir(session)
+    try:
+        os.makedirs(d, exist_ok=True)
+        idx = len(session_shots(session)) + 1
+        stamp = datetime.now().strftime("%H%M%S")
+        base = os.path.join(d, f"redeye_{idx:02d}_{stamp}")
+        cv2.imwrite(f"{base}_extract.png", extract)
+        cv2.imwrite(f"{base}_mask.png", mask)
+        print(f"  session {session}: saved shot {idx} "
+              f"({int(cv2.countNonZero(mask))}px)")
+        # Ship the same pair so the dev machine can mosaic the session too.
+        if TRANSFER_ENABLED:
+            for suffix, im in (("extract.png", extract),
+                               ("mask.png", mask)):
+                ok, buf = cv2.imencode(".png", im)
+                if ok:
+                    _post_to_receiver(f"session_{session}",
+                                      f"redeye_{idx:02d}_{stamp}_{suffix}",
+                                      buf.tobytes())
+        return f"{base}_extract.png"
+    except (OSError, cv2.error) as e:                # noqa: BLE001
+        print(f"[SESSION ERROR] could not save red-eye extract: {e}")
+        return None
+
+
+def build_session_mosaic(session, show=True):
+    """Stitch this session's red-eye extracts.  Returns (mosaic, info) or (None, {}).
+
+    Runs the shared mosaic.py, so the Pi and the dev machine produce the same
+    result from the same inputs.
+    """
+    try:
+        import mosaic
+    except ImportError as e:                         # noqa: BLE001
+        print(f"[MOSAIC] unavailable: {e}")
+        return None, {}
+    d = session_dir(session)
+    shots = session_shots(session)
+    if len(shots) < SESSION_MIN_FOR_MOSAIC:
+        print(f"[MOSAIC] need at least {SESSION_MIN_FOR_MOSAIC} captures, "
+              f"have {len(shots)}.")
+        return None, {}
+    print(f"[MOSAIC] stitching {len(shots)} red-eye extract(s) from session {session}...")
+    out = os.path.join(d, "mosaic.png")
+    mos, info, paths = mosaic.build(d, out)
+    if mos is None:
+        print("[MOSAIC] failed - no reliable alignment between the captures.")
+        return None, info
+    print(f"[MOSAIC] used {info['used']}/{len(paths)} "
+          f"(detector {info['detector']}); saved {out}")
+    if show and CV2_AVAILABLE:
+        vis = mos
+        if vis.shape[0] > 720:
+            s = 720.0 / vis.shape[0]
+            vis = cv2.resize(vis, (int(vis.shape[1] * s), 720))
+        cv2.imshow("Red-eye mosaic", vis)
+        cv2.waitKey(1)
+    if TRANSFER_ENABLED:
+        try:
+            ok, buf = cv2.imencode(".png", mos)
+            if ok:
+                _post_to_receiver(f"session_{session}", "mosaic.png", buf.tobytes())
+        except cv2.error:
+            pass
+    return mos, info
+
+
+def browse_session_shots(session, window="Session captures"):
+    """Step through this session's captures ONE AT A TIME, at full size.
+
+    Blocks the live feed while open — that is the point: a tiled sheet is too
+    small to judge a reflex by, so this shows each frame as captured.
+
+        SPACE / n / right   next        m   extract <-> mask
+        p / left            previous    ESC / q / v   close
+    """
+    if not CV2_AVAILABLE:
+        return False
+    try:
+        import mosaic
+    except ImportError as e:                         # noqa: BLE001
+        print(f"[VIEW] unavailable: {e}")
+        return False
+    imgs, masks, paths = mosaic.load_session(session_dir(session))
+    if not imgs:
+        print(f"[VIEW] session {session} has no captures yet.")
+        return False
+
+    i = 0
+    show_mask = False
+    print(f"[VIEW] {len(imgs)} capture(s) - SPACE/n/right=next, p/left=prev, "
+          f"m=mask, ESC/q=close")
+    try:
+        while True:
+            src = imgs[i]
+            if show_mask and masks[i] is not None:
+                vis = cv2.cvtColor(masks[i], cv2.COLOR_GRAY2BGR)
+            else:
+                vis = src.copy()
+            if vis.shape[0] > 900:                   # only shrink if it must
+                s = 900.0 / vis.shape[0]
+                vis = cv2.resize(vis, (int(vis.shape[1] * s), 900))
+            px = int(cv2.countNonZero(masks[i])) if masks[i] is not None else -1
+            label = (f"[{i + 1}/{len(imgs)}] "
+                     f"{os.path.basename(paths[i]).replace('_extract.png', '')}"
+                     + (f"  {px}px" if px >= 0 else "")
+                     + ("  MASK" if show_mask else ""))
+            for col, th in (((0, 0, 0), 3), ((255, 255, 255), 1)):
+                cv2.putText(vis, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, col, th, cv2.LINE_AA)
+            cv2.imshow(window, vis)
+            k = cv2.waitKeyEx(0)
+            if k in (27, ord('q'), ord('v')):
+                break
+            if k in (32, ord('n'), 65363):           # space / n / right
+                i = (i + 1) % len(imgs)
+            elif k in (ord('p'), 65361):             # p / left
+                i = (i - 1) % len(imgs)
+            elif k == ord('m'):
+                show_mask = not show_mask
+    finally:
+        try:
+            cv2.destroyWindow(window)
+        except Exception:                            # noqa: BLE001
+            pass
+    return True
+
+
+def show_session_shots(session):
+    """Open a contact sheet of this session's constituent extracts."""
+    try:
+        import mosaic
+    except ImportError as e:                         # noqa: BLE001
+        print(f"[MOSAIC] unavailable: {e}")
+        return False
+    imgs, _, paths = mosaic.load_session(session_dir(session))
+    if not imgs:
+        print(f"[MOSAIC] session {session} has no captures yet.")
+        return False
+    sheet = mosaic.contact_sheet(
+        imgs, labels=[os.path.basename(p).replace("_extract.png", "")
+                      for p in paths])
+    if sheet is None:
+        return False
+    if CV2_AVAILABLE:
+        if sheet.shape[0] > 800:
+            s = 800.0 / sheet.shape[0]
+            sheet = cv2.resize(sheet, (int(sheet.shape[1] * s), 800))
+        cv2.imshow("Session captures", sheet)
+        cv2.waitKey(1)
+    print(f"[MOSAIC] session {session}: {len(imgs)} capture(s) - "
+          + ", ".join(os.path.basename(p) for p in paths))
+    return True
 
 
 def _post_to_receiver(folder, filename, data):
@@ -2323,7 +3807,7 @@ def upload_calibration_image(bgr):
 
 
 def transfer_capture(ambient_array, flash_array, both_array=None, detect_bgr=None,
-                     dark_array=None, redeye=None, pupil_center=None):
+                     dark_array=None, redeye=None, pupil_center=None, session=None):
     """Stage the raw capture frames locally and POST them to the dev machine.
 
     Writes LOCAL_STAGING_DIR/capture_<timestamp>/{ambient.jpg, flash.jpg, both.jpg,
@@ -2334,6 +3818,10 @@ def transfer_capture(ambient_array, flash_array, both_array=None, detect_bgr=Non
     are the Pi-side overlays/outputs.  meta.json is uploaded LAST so the receiver
     only triggers once the whole folder has arrived.
 
+    `ambient_array` may be None (the sweep-triggered dark+flash capture): meta's
+    `has_ambient` flag tells the receiver not to wait for ambient.jpg and to skip
+    the detectors that need it.
+
     Any failure is reported on the Pi but never raised — a transfer problem
     must not interrupt capture or streaming.
     """
@@ -2342,12 +3830,14 @@ def transfer_capture(ambient_array, flash_array, both_array=None, detect_bgr=Non
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     folder = os.path.join(LOCAL_STAGING_DIR, f"capture_{stamp}")
-    fnames = ["ambient.jpg", "flash.jpg"]
+    fnames = ["flash.jpg"]
 
     # ── stage the frames locally ──
     try:
         os.makedirs(folder, exist_ok=True)
-        Image.fromarray(ambient_array).save(os.path.join(folder, "ambient.jpg"))
+        if ambient_array is not None:
+            Image.fromarray(ambient_array).save(os.path.join(folder, "ambient.jpg"))
+            fnames.append("ambient.jpg")
         Image.fromarray(flash_array).save(os.path.join(folder, "flash.jpg"))
         if both_array is not None:
             Image.fromarray(both_array).save(os.path.join(folder, "both.jpg"))
@@ -2375,6 +3865,8 @@ def transfer_capture(ambient_array, flash_array, both_array=None, detect_bgr=Non
             "swirski_debug": SWIRSKI_DEBUG,
             "has_both":      both_array is not None,
             "has_dark":      dark_array is not None,
+            "has_ambient":   ambient_array is not None,
+            "session":       session,      # groups a streaming run for mosaicing
             "pupil_center":  ([round(float(pupil_center[0]), 1),
                                round(float(pupil_center[1]), 1)]
                               if pupil_center is not None else None),
@@ -2462,9 +3954,10 @@ def capture_image(picam2, live_center_frac=None, live_radius_frac=None):
 
     # ── 1) FLASH ONLY (GPIO 17) ──
     flash_on()
-    time.sleep(FLASH_PRE_DELAY)
+    
     _drain_frames(picam2)              # flush frames exposed before LED on
     flash_array = picam2.capture_array()
+    time.sleep(FLASH_PRE_DELAY)
 
     # ── 2) FLASH + AMBIENT (both LEDs) ──
     ambient_on()
@@ -2529,6 +4022,85 @@ def capture_image(picam2, live_center_frac=None, live_radius_frac=None):
     print("Captured.")
 
 
+def capture_flash_pair(picam2, live_center_frac=None, live_radius_frac=None,
+                       session=None):
+    """Capture just the DARK + FLASH frames at the end of the target search.
+
+    The search has already aligned the eye under a held flash and the ambient LEDs
+    are off, so there is nothing left for the ambient / flash+ambient frames to
+    contribute — and skipping them keeps the eye still and avoids re-lighting the
+    ambient LEDs mid-alignment.  redeye_extract only needs the dark reference; the
+    ambient frame is a soft prior it tolerates as None.
+
+    Everything goes DARK for AUTOCAP_DILATE seconds first, so the pupil dilates
+    before the shot that matters — the search has just held the flash on the eye,
+    which constricts it, and a wider pupil passes more fundus light.  The dark
+    reference frame is taken at the END of that window: it costs nothing extra and
+    it is pupil-size-matched to the flash frame that follows immediately after.
+
+    `session` groups this take with the others from the same streaming session, so
+    their red-eye extracts can be mosaicked together later.
+
+    The flash is expected to be ON on entry and is left OFF on return.
+    """
+    print(f"Capture -> dark {AUTOCAP_DILATE:.1f}s to dilate, then flash...")
+
+    apply_camera_settings(picam2, FLASH_GAIN)
+    time.sleep(0.02)
+
+    # ── 0) DARK (all off) — dilate, then take the subtraction reference ──
+    flash_off()
+    ambient_off()
+    time.sleep(AUTOCAP_DILATE)         # pupil dilation, in the dark
+    _drain_frames(picam2)              # flush frames still exposed under the flash
+    dark_array = picam2.capture_array()
+
+    # ── 1) FLASH — the retroreflection, pupil still dilated ──
+    flash_on()
+    time.sleep(FLASH_PRE_DELAY)
+    _drain_frames(picam2)              # flush frames exposed before the LED came on
+    flash_array = picam2.capture_array()
+    flash_off()
+
+    apply_camera_settings(picam2, LIVE_GAIN)
+
+    detect_bgr = None
+    redeye = None
+    pupil_center = None
+    img = None
+    if CV2_AVAILABLE:
+        try:
+            detect_bgr, redeye, pupil_center = _redeye_capture(
+                None, flash_array, dark_array, live_center_frac, live_radius_frac)
+            img = Image.fromarray(cv2.cvtColor(detect_bgr, cv2.COLOR_BGR2RGB))
+        except Exception as e:                     # noqa: BLE001
+            import traceback
+            print(f"[REDEYE ERROR] {e!r}")
+            traceback.print_exc()
+    if img is None:
+        img = process_image(flash_array, [])
+
+    # Keep the raw red-eye extract for this session's mosaic BEFORE transferring,
+    # so a network problem cannot cost us the material.
+    if session and redeye is not None and redeye.valid:
+        save_session_redeye(session, redeye)
+
+    transfer_capture(None, flash_array, None, detect_bgr, dark_array,
+                     redeye, pupil_center, session=session)
+    img.save(PHOTO_PATH)
+
+    if REDEYE_PREVIEW and CV2_AVAILABLE and redeye is not None \
+            and redeye.overlay is not None:
+        ro = redeye.overlay
+        if ro.shape[0] > 720:
+            s = 720.0 / ro.shape[0]
+            ro = cv2.resize(ro, (int(ro.shape[1] * s), 720))
+        cv2.imshow("Red-eye extraction", ro)
+        cv2.waitKey(1)
+
+    print("Captured (flash + dark).")
+
+
 def _draw_detections(vis, ridge, ritnet, category):
     """Overlay BOTH detectors on the guidance image: ridge (traditional) in cyan,
     RITnet (NN) in magenta, plus a legend with the category."""
@@ -2561,17 +4133,23 @@ def _redeye_capture(ambient_array, flash_array, dark_array=None,
     captured frame's width/height, giving the red-eye centre and ROI size.  All
     alignment/guidance work happens live; this only isolates the red pixels.
 
+    `ambient_array` may be None — the sweep-triggered capture takes only the dark
+    and flash frames, and redeye_extract treats the ambient frame as an optional
+    soft prior.
+
     Returns (overlay_bgr, redeye, pupil_center) — the red-eye highlight overlay (or
     a brightened flash if no region is known), the RedeyeResult (or None), and the
     full-frame pupil coords used.
     """
     rot = _CV2_ROTATIONS[LIVE_ROTATION]
-    amb_bgr = cv2.cvtColor(ambient_array, cv2.COLOR_RGB2BGR)
+    amb_bgr = (cv2.cvtColor(ambient_array, cv2.COLOR_RGB2BGR)
+               if ambient_array is not None else None)
     flash_bgr = cv2.cvtColor(flash_array, cv2.COLOR_RGB2BGR)
     dark_bgr = (cv2.cvtColor(dark_array, cv2.COLOR_RGB2BGR)
                 if dark_array is not None else None)
     if rot is not None:
-        amb_bgr = cv2.rotate(amb_bgr, rot)
+        if amb_bgr is not None:
+            amb_bgr = cv2.rotate(amb_bgr, rot)
         flash_bgr = cv2.rotate(flash_bgr, rot)
         if dark_bgr is not None:
             dark_bgr = cv2.rotate(dark_bgr, rot)
@@ -2635,10 +4213,13 @@ def calibrate_cover(picam2):
 
 
 def _set_cover_side(side):
-    """Set which image edge the LED cover sits on: "top" (left eye) / "bottom"
-    (right eye).  The two eyes differ by a 180° rig flip, so switching side adds
-    180° to LIVE_ROTATION; the cover mask follows (load_cover_mask) and the
-    detection geometry auto-detects the side, so everything stays consistent.
+    """Set which image edge the LED cover sits on: "top" or "bottom".
+
+    The two rig orientations differ by a 180° flip, so switching side adds 180° to
+    LIVE_ROTATION; the cover mask follows (load_cover_mask) and the detection
+    geometry reads the side back off the mask, so everything stays consistent.
+    Relative (not a fixed rotation per side) so any arrow-key rotation offset the
+    operator has dialled in survives a side switch.
     """
     global COVER_SIDE, LIVE_ROTATION
     side = "bottom" if str(side).lower().startswith("b") else "top"
@@ -2649,16 +4230,16 @@ def _set_cover_side(side):
 
 
 def _prompt_cover_orientation():
-    """Ask which edge the LED cover sits on before streaming (default top = left
-    eye).  Choosing the opposite side rotates the feed 180°.  A missing terminal
-    or blank input keeps the default.  Switch later live with `f` / `cover_side`.
+    """Ask which edge the LED cover sits on before streaming.
+
+    Choosing the opposite side rotates the feed 180°.  A missing terminal or blank
+    input keeps the default.  Switch later live with `f` / `cover_side`.
     """
     try:
-        ans = input("LED cover at [t]op (left eye, default) or "
-                    "[b]ottom (right eye)? ").strip().lower()
+        ans = input("LED cover at [t]op or [b]ottom (default)? ").strip().lower()
     except EOFError:
         ans = ""
-    _set_cover_side("bottom" if ans.startswith("b") else "top")
+    _set_cover_side("top" if ans.startswith("t") else "bottom")
     print(f"Cover side: {COVER_SIDE}  (rotation {LIVE_ROTATION * 90}°).\n")
 
 
@@ -2668,10 +4249,15 @@ def streaming_mode(picam2):
     SPACE (hold) / r — flash LED (GPIO 17), hold / lock
     a               — toggle ambient LED (GPIO 22/27/23/6/26/16)
     p               — toggle live Orlosky pupil detection
-    g               — toggle the live guidance arrow (arms auto-capture when centred)
+    g               — start/stop the staged alignment session (arms auto-capture):
+                        centre (pupil -> camera centre) -> sweep -> capture
+                        (a find_cover stage runs first when USE_LIVE_COVER is on)
     k               — authorise the next auto-capture (after one fires)
     t               — toggle PC image transfer (HTTP-POST to receiver.py)
-    f               — flip to the other eye (cover top<->bottom, 180°)
+    f               — flip the cover side (top<->bottom, rotates the feed 180°)
+    SHIFT (or h)    — toggle the live red-eye highlight (on by default)
+    o               — PAUSE the feed and mosaic this session's red-eye captures
+    v               — view this session's constituent captures (contact sheet)
     m               — toggle RITnet: every capture <-> only when ridge weak
     c               — snap an LED-cover calibration (no eye), instant; ships the
                       current frame (LEDs left as-is) for the dev machine to build
@@ -2688,9 +4274,10 @@ def streaming_mode(picam2):
         return
 
     print("\nStreaming mode ON")
-    print("SPACE=flash | r=lock | a=ambient | p=pupil-detect | g=guide-arrow | "
-          "k=authorise-autocap | t=pc-transfer | f=flip-eye | "
-          "c=calibrate-cover | ←/→=rotate | ENTER/e=capture | s=exit\n")
+    print("SPACE=flash | r=lock | a=ambient | p=pupil-detect | g=staged-guidance | "
+          "k=authorise-autocap | SHIFT/h=redeye-highlight | o=mosaic | v=view-shots | "
+          "t=pc-transfer | f=flip-cover-side | c=calibrate-cover | ←/→=rotate | "
+          "ENTER/e=capture | s=exit\n")
 
     apply_camera_settings(picam2, FLASH_GAIN)
 
@@ -2721,18 +4308,62 @@ def streaming_mode(picam2):
     led_on = False
     lock_on = False
     ambient_led_on = False
-    import guidance
     swirski_live_on = SWIRSKI_LIVE_DEFAULT
-    live_guide_on = False                  # 'g': draw the guidance arrow live
-    _live_guide = guidance.GuidanceTracker()
+
+    # ── staged alignment session ('g') ──
+    # _stage is the single source of truth for where the session is; None = off.
+    #   find_cover — ambient on, locate the dark LED-cover outline live
+    #                (SKIPPED while USE_LIVE_COVER is off)
+    #   centre     — ambient on, drive the pupil onto the target (strict in y)
+    #   sweep      — ambient OFF / flash HELD, step the gaze and track the red reflex
+    #   capture    — fire the dark+flash pair at the peak
+    START_STAGE = (guidance.STAGE_FIND_COVER if USE_LIVE_COVER
+                   else guidance.STAGE_CENTRE)
+    _stage = None
+    _live_guide = guidance.GuidanceTracker(dead_x_frac=CENTRE_DEAD_X_FRAC,
+                                           dead_y_frac=CENTRE_DEAD_Y_FRAC)
+    _cover = CoverTracker()
+    _sweep = None                          # ApproachState / TargetSearch while lit
+    _sweep_dark = None                     # all-off reference frame (display coords)
+    _sweep_ambient = None                  # fresh ambient companion for the veto
+    _sweep_amb_on = False                  # ambient LEDs currently driven BY the sweep
+    # Blink detection runs ONLY in the red-eye stages, on their ambient frames.
+    _blink = BlinkDetector()
     _live_center = None
     _live_radius = None                    # live pupil radius (disp px) -> red-eye ROI
-    _autocap_armed = False                 # auto-capture when centred (armed by 'g'/'k')
+    _autocap_armed = False                 # auto-capture at the sweep peak ('g'/'k')
     _centred_count = 0
     _last_autocap = 0.0
     _detect_counter = 0
     _overlay_cache = None
+    _pre_sweep_ambient = False             # ambient state to restore if the sweep aborts
+
+    # ── capture session (for red-eye mosaicing) ──
+    # One streaming run groups its takes under a single id, so their red-eye
+    # extracts can be stitched together with 'o' without picking files by hand.
+    _session = datetime.now().strftime("%Y%m%d_%H%M%S")
+    print(f"Capture session: {_session}  "
+          f"('o' = mosaic the session, 'v' = view its captures)")
+
+    # ── live red-eye highlight (SHIFT toggles) ──
+    # Whenever the flash is lit and an all-off reference frame is on hand, the
+    # detected red-eye pixels are tinted straight onto the feed, so the operator
+    # can see what the sweep is measuring instead of trusting the number.
+    redeye_hl_on = REDEYE_HIGHLIGHT_DEFAULT
+    _live_dark = None                      # most recent all-LEDs-off frame (disp)
+    _redeye_mask = None                    # last computed red-eye selection
+    _hl_counter = 0                        # ticks EVERY frame (unlike _detect_counter)
     exit_reason = "unknown"
+
+    def _grab_disp():
+        """One fresh frame in display orientation/size (same path as the loop's)."""
+        a = picam2.capture_array()
+        f = cv2.cvtColor(a, cv2.COLOR_RGB2BGR)
+        r = _CV2_ROTATIONS[LIVE_ROTATION]
+        if r is not None:
+            f = cv2.rotate(f, r)
+        return cv2.resize(f, (DISPLAY_W, DISPLAY_H) if LIVE_ROTATION % 2 == 1
+                          else (DISPLAY_H, DISPLAY_W))
 
     # WND_PROP_VISIBLE is unsupported on some backends (this Pi's GTK build returns
     # -1 even for a visible window), which made the close-on-X check exit streaming
@@ -2757,14 +4388,37 @@ def streaming_mode(picam2):
             else:
                 disp = cv2.resize(frame, (DISPLAY_H, DISPLAY_W))
 
+            # The un-annotated frame.  The staged session measures on THIS, never on
+            # `disp` — which picks up the pupil overlay and the guidance drawing as
+            # the iteration goes on, and would poison the red-pixel count.
+            clean = disp
+
+            # Keep the most recent all-LEDs-off frame as the red-eye subtraction
+            # reference, so the live highlight works outside the sweep too (e.g.
+            # while holding SPACE).  Both LEDs off => this frame IS a dark frame.
+            _hl_counter += 1
+            # NB: test the ACTUAL lamp state, not the operator's `ambient_led_on`
+            # toggle — during the sweep the phase machine drives the ambient LEDs
+            # independently, and an ambient-lit frame stored as the "dark"
+            # reference would wreck both the highlight and the red-shift subtraction.
+            amb_lit = ambient_led_on or _sweep_amb_on
+            if not led_on and not amb_lit:
+                _live_dark = clean             # genuinely all-off => a dark frame
+                if _stage not in _LIT_STAGES:
+                    _redeye_mask = None
+            elif not led_on and _stage not in _LIT_STAGES:
+                _redeye_mask = None            # flash off => no retroreflection
+
             # Live pupil detection (ridge) — recompute every N frames; runs when
-            # the pupil overlay (p) OR live guidance (g) is on.
-            if swirski_live_on or live_guide_on:
+            # the pupil overlay (p) OR the staged session (g) is on.  Skipped during
+            # the sweep: the frame is flash-lit and near-black there, and the sweep
+            # runs its own detection inside measure_red_fraction.
+            if swirski_live_on or _stage is not None:
                 _detect_counter += 1
                 fresh = (_overlay_cache is None
                          or _detect_counter % _LIVE_DETECT_SKIP == 0)
-                if fresh:
-                    gray = cv2.cvtColor(disp, cv2.COLOR_BGR2GRAY)
+                if fresh and _stage not in _LIT_STAGES:
+                    gray = cv2.cvtColor(clean, cv2.COLOR_BGR2GRAY)
                     _overlay_cache = detect_pupil(gray, live=True)
                     if _LAST_PUPIL is not None:
                         _live_center = (_LAST_PUPIL[0], _LAST_PUPIL[1])
@@ -2774,45 +4428,270 @@ def streaming_mode(picam2):
                         _live_radius = None
                 if swirski_live_on and _overlay_cache:
                     disp = _draw_overlays(disp.copy(), _overlay_cache)
-                # Live guidance arrow: target the LED-cover edge, arrow from it to
-                # the pupil, plain-language instruction.  Everything in disp coords
-                # (cover mask resized to the display), so it lines up with the feed.
-                if live_guide_on:
-                    cover_disp = load_cover_mask(disp.shape[:2])
-                    tgt = guidance.target_point(disp.shape, cover_disp,
-                                                GUIDANCE_TARGET_MODE)
-                    lg = _live_guide.update(_live_center, disp.shape, tgt, 1.0, "live")
-                    disp = guidance.annotate(disp, lg, tgt, _live_center)
 
-                    # Auto-capture when centred (only on fresh detections; debounced,
-                    # armed, cooled-down).  Disarms after firing -> 'k' re-authorises.
+            # ───────── STAGED ALIGNMENT SESSION ─────────
+            # Everything below works in DISPLAY coords (the cover mask, the target,
+            # the pupil and the red-eye ROI all share the resized frame), so the
+            # overlay lines up with what the operator sees.
+            if _stage is not None:
+                extra = _cover.status() if USE_LIVE_COVER else ""
+
+                # ── find_cover: locate the dark cover outline, no calibration ──
+                if _stage == guidance.STAGE_FIND_COVER:
                     if fresh:
-                        _centred_count = _centred_count + 1 if lg.state == "centred" else 0
-                        if (_autocap_armed and _centred_count >= AUTOCAP_CENTRED_FRAMES
+                        _cover.update(clean, _live_center)
+                    if _cover.found:
+                        if (_cover.side != COVER_SIDE
+                                and not _cover.from_calibration):
+                            print(f"WARNING: cover detected on the {_cover.side} but "
+                                  f"cover_side is '{COVER_SIDE}' - the rig is flipped "
+                                  f"relative to the prompt.  Press 'f' to correct.")
+                        _stage = guidance.STAGE_CENTRE
+                        _live_guide.reset()
+                        _centred_count = 0
+                        if not ambient_led_on:
+                            ambient_on(); ambient_led_on = True
+                        print(f"Stage -> centre (cover on the {_cover.side})")
+
+                # With live cover detection off there is no mask: the target is the
+                # camera centre and nothing downstream vetoes on the cover.
+                cover_disp = _cover.mask if USE_LIVE_COVER else None
+                tgt = guidance.target_point(disp.shape, cover_disp,
+                                            GUIDANCE_TARGET_MODE)
+
+                # ── centre: pupil into the box; patient fixates the target ──
+                if _stage == guidance.STAGE_CENTRE:
+                    lg = _live_guide.update(_live_center, disp.shape, tgt, 1.0, "live")
+                    # The patient's line never changes; the operator's camera move
+                    # goes underneath it, so both read from the same place.
+                    lg.hint = guidance.camera_hint(_live_center, tgt, disp.shape)
+                    lg.instruction = guidance.INSTRUCTION_LOOK
+                    if fresh:
+                        _centred_count = (_centred_count + 1
+                                          if lg.state == "centred" else 0)
+                        if (_autocap_armed and _centred_count >= CENTRE_HOLD_FRAMES
                                 and time.time() - _last_autocap > AUTOCAP_COOLDOWN):
-                            _autocap_armed = False
-                            _last_autocap = time.time()
+                            # Hand over to the flash-lit approach.  Take the all-off
+                            # dark reference FIRST (every red measurement subtracts
+                            # it), then run the ambient/flash cycle from here on.
                             _centred_count = 0
-                            # Fractional pupil region from THIS centred live frame
-                            # (disp space) -> used as the red-eye location + ROI size.
-                            frac = ((_live_center[0] / disp.shape[1],
-                                     _live_center[1] / disp.shape[0])
-                                    if _live_center is not None else None)
-                            rad_frac = (_live_radius / disp.shape[1]
-                                        if _live_radius else None)
-                            print(f"Centred in live feed -> auto-capture: ambient off, "
-                                  f"dilating {AUTOCAP_DILATE:.1f}s, then flash. "
-                                  f"(press 'k' to authorise the next)")
-                            if ambient_led_on:
-                                ambient_off()
+                            _pre_sweep_ambient = ambient_led_on
+                            ambient_off()
                             flash_off(); led_on = False
-                            cv2.imshow(WINDOW_NAME, disp); cv2.waitKey(1)
-                            time.sleep(AUTOCAP_DILATE)     # pupil dilation
-                            capture_image(picam2, frac, rad_frac)
-                            if ambient_led_on:
-                                ambient_on()
+                            _drain_frames(picam2)
+                            _sweep_dark = _grab_disp()
+                            flash_on(); led_on = True
                             apply_camera_settings(picam2, FLASH_GAIN)
-                            _live_guide.reset()
+                            _drain_frames(picam2)
+                            side = ((_cover.side or COVER_SIDE)
+                                    if USE_LIVE_COVER else COVER_SIDE)
+                            _sweep = ApproachState(side, _live_center, _live_radius)
+                            _blink.reset()   # new eye/lighting: relearn "open"
+                            _stage = guidance.STAGE_APPROACH
+                            print(f"Stage -> approach: move the scope so the pupil "
+                                  f"nears the {guidance.cover_edge_word(side)} edge "
+                                  f"(need {APPROACH_GOOD_PX}px of red)")
+                    # In centring the two coincide — the pupil belongs on the same
+                    # point the patient is looking at — but both markers are drawn
+                    # anyway so the vocabulary is identical in every stage.
+                    disp = guidance.annotate(
+                        disp, lg, tgt, _live_center,
+                        deadzone_box=_live_guide.deadzone_box(disp.shape),
+                        extra=extra, cover_mask=cover_disp, fixation=True,
+                        hold_point=tgt)
+
+                # ── approach / target: both run the ambient/flash cycle ──
+                elif _stage in (guidance.STAGE_APPROACH, guidance.STAGE_TARGET):
+                    # The LEDs are driven at the bottom of the loop from
+                    # _sweep.lighting(); here we just consume the frames it produces.
+                    if _stage == guidance.STAGE_TARGET:
+                        # Move the point EVERY frame so it glides; measure only on
+                        # fresh ones.  Driving both from the measurement cadence
+                        # made it lurch, which a gaze cannot follow.
+                        _sweep.tick()
+                        tgt = _sweep.target()      # the moving fixation point
+
+                        # CONTINUOUS scan: flash is held, so there is no cycle to
+                        # wait on — measure against the dark reference inherited
+                        # from the approach stage.
+                        if fresh and _sweep_dark is not None:
+                            meas = measure_red_fraction(
+                                clean, _sweep_dark, _sweep.center, _sweep.radius0,
+                                cover_disp)          # no ambient companion here
+                            _redeye_mask = meas["mask"]
+                            if _sweep.worth_saving(meas):
+                                save_session_frame(_session, meas["extract"],
+                                                   meas["mask"])
+                            _sweep.submit(meas)
+                    elif fresh and _sweep.ready():
+                        if _sweep.phase == _sweep.PHASE_AMBIENT:
+                            _sweep_ambient = clean          # the veto companion
+                            _amb_gray = cv2.cvtColor(clean, cv2.COLOR_BGR2GRAY)
+                            # Blink check FIRST, on the ambient frame — the only
+                            # one in the cycle where the eye is lit well enough to
+                            # tell an open pupil from a closed lid.  A spoiled
+                            # cycle is thrown away whole rather than measured.
+                            # Detection runs first: whether it found the pupil is
+                            # the blink detector's primary cue, and needs no
+                            # photometric calibration.
+                            detect_pupil(_amb_gray, live=True)
+                            if _blink.update(clean, _sweep.center, _sweep.radius0,
+                                             pupil_found=_LAST_PUPIL is not None,
+                                             pupil_conf=_LAST_CONF):
+                                # Spoiled — and do NOT adopt this frame's pupil.
+                                # A lid gives a confident-looking fit on a crease,
+                                # and taking it would drag the ROI off the pupil
+                                # for every cycle that follows.
+                                _sweep.spoiled = True
+                                _overlay_cache = None
+                            elif _LAST_PUPIL is not None:
+                                _sweep.check_ambient_pupil(
+                                    (_LAST_PUPIL[0], _LAST_PUPIL[1]),
+                                    _LAST_CONF, clean.shape)
+                                if _LAST_CONF >= SWEEP_TRACK_CONF:
+                                    _sweep.radius0 = _LAST_PUPIL[2]
+                                    # Keep the loop's own tracked pupil current
+                                    # too, so the camera hint, a manual capture
+                                    # and a drop back to centring all start from
+                                    # where the eye actually is now.
+                                    _live_center = (_LAST_PUPIL[0], _LAST_PUPIL[1])
+                                    _live_radius = _LAST_PUPIL[2]
+                            _sweep.to_dark()
+                        elif _sweep.phase == _sweep.PHASE_DARK:
+                            # All LEDs off: the pupil has re-opened after the
+                            # ambient blip, and this frame is a fresh subtraction
+                            # reference registered with the eye where it is NOW.
+                            _sweep_dark = clean
+                            _sweep.to_flash()
+                        elif _sweep.phase == _sweep.PHASE_FLASH and _sweep.spoiled:
+                            # Discarded: not measured, not submitted, and NOT
+                            # counted as a lost reflex — a blink is not evidence
+                            # that the alignment is wrong.  Just run the cycle
+                            # again once the eye is open.
+                            _sweep.spoiled = False
+                            _sweep.spoiled_n += 1
+                            _sweep.to_ambient()
+                        elif _sweep.phase == _sweep.PHASE_FLASH:
+                            meas = measure_red_fraction(
+                                clean, _sweep_dark, _sweep.center, _sweep.radius0,
+                                cover_disp, ambient_bgr=_sweep_ambient)
+                            _redeye_mask = meas["mask"]   # reuse for the highlight
+                            # Bank confident reflexes as they happen: the gaze is
+                            # being walked around, so successive measurements see
+                            # different parts of the fundus — mosaic material the
+                            # single end-of-search capture cannot provide.
+                            if _sweep.worth_saving(meas):
+                                save_session_frame(_session, meas["extract"],
+                                                   meas["mask"])
+                            _sweep.submit(meas)
+                        else:                               # dwell elapsed
+                            _sweep.to_ambient()
+
+                    if _sweep.abort:
+                        # Restore ambient light and go back to centring rather than
+                        # carrying on against a signal we no longer trust.
+                        print(f"{_stage} aborted: {_sweep.abort} -> back to centring")
+                        flash_off(); led_on = False
+                        ambient_on(); ambient_led_on = True; _sweep_amb_on = False
+                        apply_camera_settings(picam2, FLASH_GAIN)
+                        _sweep = None
+                        _sweep_ambient = None
+                        _redeye_mask = None
+                        _live_guide.reset()
+                        _centred_count = 0
+                        _stage = guidance.STAGE_CENTRE
+                    elif _sweep.done and _stage == guidance.STAGE_APPROACH:
+                        # Enough red to work with — hand over to the target search,
+                        # which now steers the eye by moving the fixation point.
+                        _sweep = GazeScan(tgt, _sweep.center, _sweep.radius0,
+                                          disp.shape, _sweep.cover_side)
+                        _stage = guidance.STAGE_TARGET
+                        print("Stage -> gaze scan: flash held steady (no ambient "
+                              "switching), sweeping the fixation point to find "
+                              "the best gaze direction")
+                    elif _sweep.done:
+                        _stage = guidance.STAGE_CAPTURE
+                    else:
+                        # Always show the blink numbers: the photometric cue is
+                        # only synthetically validated, so the live readout is
+                        # what it gets calibrated from.
+                        sub = _sweep.status() + "  " + _blink.status()
+                        if _sweep.spoiled_n:
+                            sub += f" skipped={_sweep.spoiled_n}"
+                        hold = None
+                        if _stage == guidance.STAGE_APPROACH:
+                            sub = _sweep.hint() + "  |  " + sub
+                            cam = _sweep.camera_hint(disp.shape, tgt)
+                            vec = _sweep.camera_vector(disp.shape, tgt)
+                            # Here the two markers genuinely pull apart: the gaze
+                            # stays on the fixation point while the pupil has to
+                            # travel to the cover edge.
+                            hold = guidance.approach_destination(
+                                disp.shape, _sweep.cover_side, tgt[0], cover_disp)
+                        else:
+                            cam = _sweep.camera_hint(disp.shape)
+                            vec = None          # the gaze moves here, not the scope
+                            hold = _sweep.hold  # ...so show where to keep the pupil
+                        sg = guidance.Guidance(state=_stage,
+                                               instruction=guidance.INSTRUCTION_LOOK,
+                                               hint=cam, hint_vector=vec)
+                        disp = guidance.annotate(disp, sg, tgt, _sweep.center,
+                                                 extra=sub, cover_mask=cover_disp,
+                                                 fixation=True, hold_point=hold)
+
+                # ── capture: dilate in the dark, then the dark+flash pair ──
+                if _stage == guidance.STAGE_CAPTURE:
+                    _autocap_armed = False          # one take; 'k' re-authorises
+                    _last_autocap = time.time()
+                    frac = ((_sweep.best_center[0] / disp.shape[1],
+                             _sweep.best_center[1] / disp.shape[0])
+                            if _sweep.best_center is not None else None)
+                    rad_frac = (_sweep.best_radius / disp.shape[1]
+                                if _sweep.best_radius else None)
+                    print(f"Gaze scan best red={_sweep.best_px}px from "
+                          f"{_sweep.samples_n} sample(s) -> capturing "
+                          f"(press 'k' to authorise the next)")
+                    cv2.imshow(WINDOW_NAME, disp); cv2.waitKey(1)
+                    capture_flash_pair(picam2, frac, rad_frac, session=_session)
+                    led_on = False                  # capture_flash_pair leaves it off
+                    _sweep_amb_on = False           # sweep no longer owns the ambient
+                    if _pre_sweep_ambient:
+                        ambient_on(); ambient_led_on = True
+                    apply_camera_settings(picam2, FLASH_GAIN)
+                    _sweep = None
+                    _sweep_dark = None
+                    _sweep_ambient = None
+                    _redeye_mask = None
+                    _live_guide.reset()
+                    _cover.reset()
+                    _centred_count = 0
+                    _stage = START_STAGE
+
+            # ── live red-eye highlight ──
+            # The sweep already computed a mask above; outside it, compute one on
+            # every _LIVE_DETECT_SKIP-th frame whenever the flash is lit and a dark
+            # reference exists.  This runs off its OWN counter, not the detection
+            # loop's `fresh`, so the highlight still works with pupil detection and
+            # the staged session both off (just holding SPACE).
+            if redeye_hl_on and _stage in _LIT_STAGES:
+                # The sweep owns the mask; keep drawing it across the ambient blip
+                # so the highlight doesn't strobe with the lighting cycle.
+                disp = draw_redeye_highlight(disp.copy(), _redeye_mask)
+            elif redeye_hl_on and led_on and _live_dark is not None:
+                if _hl_counter % _LIVE_DETECT_SKIP == 0:
+                    # Prefer a tracked pupil; fall back to the frame centre, which
+                    # is where the pupil is being driven anyway, so the ROI still
+                    # lands on the eye when nothing is tracking it.
+                    hl_center = _live_center
+                    hl_radius = _live_radius
+                    if hl_center is None:
+                        hl_center = (disp.shape[1] // 2, disp.shape[0] // 2)
+                        hl_radius = None
+                    hl = redeye_extract(clean, _live_dark, None, hl_center,
+                                        hl_radius,
+                                        _cover.mask if USE_LIVE_COVER else None)
+                    _redeye_mask = hl.mask if hl.valid else None
+                disp = draw_redeye_highlight(disp.copy(), _redeye_mask)
 
             cv2.imshow(WINDOW_NAME, disp)
 
@@ -2875,24 +4754,51 @@ def streaming_mode(picam2):
                 print(f"Live pupil detection: "
                       f"{'ON' if swirski_live_on else 'OFF'}")
 
-            # g toggles the live guidance arrow (target + arrow + instruction).
-            # Turning it on ARMS the first auto-capture (fires when centred).
+            # g starts/stops the staged alignment session and ARMS the first
+            # auto-capture.  Stopping mid-sweep restores the ambient lighting.
             elif key == ord('g'):
-                live_guide_on = not live_guide_on
-                _live_guide.reset()
-                _overlay_cache = None
-                _centred_count = 0
-                _autocap_armed = live_guide_on
-                print(f"Live guidance arrow: {'ON (auto-capture armed)' if live_guide_on else 'OFF'}")
+                if _stage is None:
+                    _stage = START_STAGE
+                    _cover.reset()
+                    _live_guide.reset()
+                    _overlay_cache = None
+                    _centred_count = 0
+                    _sweep = None
+                    _sweep_dark = None
+                    _sweep_ambient = None
+                    _sweep_amb_on = False
+                    _autocap_armed = True
+                    if not ambient_led_on:
+                        ambient_on(); ambient_led_on = True
+                    print(f"Staged guidance ON (auto-capture armed) -> {START_STAGE}"
+                          f"  [target: {GUIDANCE_TARGET_MODE}]")
+                else:
+                    was_sweeping = (_stage in _LIT_STAGES)
+                    _stage = None
+                    _sweep = None
+                    _sweep_dark = None
+                    _sweep_ambient = None
+                    _sweep_amb_on = False
+                    _autocap_armed = False
+                    _live_guide.reset()
+                    _cover.reset()
+                    if was_sweeping:
+                        flash_off(); led_on = False
+                        ambient_led_on = _pre_sweep_ambient
+                        if ambient_led_on:
+                            ambient_on()
+                        else:
+                            ambient_off()
+                    print("Staged guidance OFF")
 
             # k re-authorises the next auto-capture (after one has fired)
             elif key == ord('k'):
-                if live_guide_on:
+                if _stage is not None:
                     _autocap_armed = True
                     _centred_count = 0
-                    print("Auto-capture authorised - align to centre for the next take.")
+                    print("Auto-capture authorised - align for the next take.")
                 else:
-                    print("Turn on live guidance ('g') first.")
+                    print("Turn on staged guidance ('g') first.")
 
             # t toggles PC image transfer (HTTP-POST captures to receiver.py)
             elif key == ord('t'):
@@ -2900,7 +4806,7 @@ def streaming_mode(picam2):
                 print(f"PC image transfer: "
                       f"{'ON' if TRANSFER_ENABLED else 'OFF'}")
 
-            # f flips to the other eye: cover top<->bottom (180°, mask follows)
+            # f flips the cover side: top<->bottom (180°, mask follows)
             elif key == ord('f'):
                 _set_cover_side("bottom" if COVER_SIDE == "top" else "top")
                 _overlay_cache = None          # orientation changed -> redetect
@@ -2913,6 +4819,52 @@ def streaming_mode(picam2):
                 _overlay_cache = None          # cover may change -> redetect
                 print("Calibration captured.")
 
+            # SHIFT toggles the live red-eye highlight.  X11 keysyms, same family
+            # as the arrow keys below (XK_Shift_L/R = 0xFFE1/0xFFE2); some cv2
+            # backends never report a bare modifier, so 'h' does the same thing.
+            elif key in (65505, 65506) or key == ord('h'):
+                redeye_hl_on = not redeye_hl_on
+                _redeye_mask = None
+                print(f"Live red-eye highlight: "
+                      f"{'ON' if redeye_hl_on else 'OFF'}")
+
+            # o PAUSES the live feed and mosaics this session's red-eye extracts.
+            # Stitching is slow (feature detection on several frames), hence the
+            # pause: the LEDs go off and nothing else runs until it is done.
+            elif key == ord('o'):
+                n = len(session_shots(_session))
+                if n < SESSION_MIN_FOR_MOSAIC:
+                    print(f"[MOSAIC] session {_session} has {n} capture(s); "
+                          f"need {SESSION_MIN_FOR_MOSAIC}.")
+                else:
+                    print(f"--- live feed PAUSED: mosaicing {n} capture(s) ---")
+                    was_flash, was_amb = led_on, ambient_led_on
+                    flash_off(); ambient_off(); led_on = False
+                    cv2.putText(disp, "MOSAICING - paused", (10, disp.shape[0] // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    cv2.imshow(WINDOW_NAME, disp); cv2.waitKey(1)
+                    build_session_mosaic(_session)
+                    show_session_shots(_session)
+                    print("--- live feed RESUMED (any window stays open) ---")
+                    if was_amb:
+                        ambient_on()
+                    if was_flash:
+                        flash_on(); led_on = True
+                    apply_camera_settings(picam2, FLASH_GAIN)
+                    _live_dark = None       # lighting was disturbed; re-reference
+
+            # v steps through this session's captures one at a time, full size.
+            # Blocks the feed while open; LEDs off so nothing is left lit.
+            elif key == ord('v'):
+                was_flash, was_amb = led_on, ambient_led_on
+                flash_off(); ambient_off(); led_on = False
+                browse_session_shots(_session)
+                if was_amb:
+                    ambient_on()
+                if was_flash:
+                    flash_on(); led_on = True
+                _live_dark = None          # lighting was disturbed; re-reference
+
             # Arrow keys: left=CCW step, right=CW step
             elif key == 65361:  # left arrow
                 LIVE_ROTATION = (LIVE_ROTATION - 1) % 4
@@ -2921,13 +4873,31 @@ def streaming_mode(picam2):
                 LIVE_ROTATION = (LIVE_ROTATION + 1) % 4
                 print(f"Rotation: {LIVE_ROTATION * 90}°")
 
-            should_be_on = lock_on or space_held
+            # ── LED drive ──
+            # During the sweep the phase machine owns both LEDs: flash for settle
+            # and measurement, a brief ambient blip to grab the veto companion.
+            # It also counts as a reason for the flash to be lit, so a stray SPACE
+            # press-and-release cannot switch it off underneath the sweep.
+            sweeping = (_stage in _LIT_STAGES and _sweep is not None)
+            lit = _sweep.lighting() if sweeping else None
+            want_ambient = (lit == "ambient")
+            # "off" is the dark pause between the ambient blip and the measured
+            # flash frame — neither LED runs then.
+            should_be_on = lock_on or space_held or (lit == "flash")
             if should_be_on and not led_on:
                 flash_on()
                 led_on = True
             elif not should_be_on and led_on:
                 flash_off()
                 led_on = False
+
+            if sweeping:
+                if want_ambient != _sweep_amb_on:
+                    ambient_on() if want_ambient else ambient_off()
+                    _sweep_amb_on = want_ambient
+            elif _sweep_amb_on:                 # left the sweep — hand the ambient
+                _sweep_amb_on = False           # LEDs back to the operator's toggle
+                ambient_on() if ambient_led_on else ambient_off()
 
     except Exception as e:                     # noqa: BLE001 — surface WHY streaming ended
         import traceback
@@ -3070,7 +5040,7 @@ def handle_parameter_command(cmd, picam2):
             else:
                 print("Preview viewer off (any open window stays).")
 
-        # Cover side / eye: "top" (left eye) | "bottom" (right eye); flips 180°
+        # Cover side: "top" | "bottom"; switching flips the feed 180°
         elif param == "cover_side":
             if value.lower()[:1] in ("t", "b"):
                 _set_cover_side(value)
@@ -3178,7 +5148,7 @@ def main():
 
     print_settings()
 
-    # Which eye / cover side are we starting on? (top = left eye, default.)
+    # Which side is the LED cover on? (bottom = the default rig orientation.)
     _prompt_cover_orientation()
 
     # ───────── BOOT STRAIGHT INTO STREAMING MODE ─────────

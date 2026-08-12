@@ -21,6 +21,10 @@ POST /upload/<folder>/<filename>
            | calibration              -> written under calibration/; an uploaded
                                           led_cover_calib.jpg triggers building the
                                           cover mask HERE (cap.build_cover_mask)
+           | session_YYYYMMDD_HHMMSS  -> written under Sessions/; the red-eye
+                                          extracts (redeye_NN_HHMMSS_extract.png
+                                          + _mask.png) of ONE streaming run, which
+                                          are re-mosaicked here as each arrives
 <filename> = ambient.jpg | flash.jpg | both.jpg | meta.json | led_cover_calib.jpg
 
 Anything else returns 400.  No auth — only listen on a trusted local network
@@ -47,6 +51,15 @@ CALIBRATION_FOLDER = "calibration"
 CALIBRATION_DIR = os.path.join(HERE, "calibration")
 CALIB_IMAGE_NAME = "led_cover_calib.jpg"   # the raw calibration frame the Pi ships
 
+# One streaming run on the Pi = one `session_<stamp>` folder of red-eye extracts,
+# kept together under Sessions/ so they can be mosaicked into a wider fundus view
+# (see mosaic.py).  These are raw extracts, not capture triples, so they bypass
+# the guidance/categorisation path entirely.
+SESSION_PREFIX = "session_"
+SESSIONS_DIR = os.path.join(HERE, "Sessions")
+SESSION_AUTO_MOSAIC = True         # rebuild the mosaic as each new extract lands
+SESSION_MIN_FOR_MOSAIC = 2
+
 
 # ── Alignment guidance on received captures ───────────────────────────────
 # When a capture folder has its full triple, run the coarse-locate cascade
@@ -59,8 +72,10 @@ _GUIDANCE_PRIOR = None
 _PROCESSED = set()
 
 # Completed captures are sorted into these subfolders of Transfers/ by which
-# detector(s) found the pupil (see cap.classify_detection).
-CATEGORY_DIRS = ("no_pupil", "ridge_only", "ritnet_only", "both")
+# detector(s) found the pupil (see cap.classify_detection).  `flash_only` is the
+# gaze-sweep capture: dark + flash with no ambient frame, so neither detector can
+# run here and only the red-eye extraction is done.
+CATEGORY_DIRS = ("no_pupil", "ridge_only", "ritnet_only", "both", "flash_only")
 
 # Per-capture detection log appended to Transfers/index.csv (raw centres +
 # confidences from both detectors, the category, and the guidance instruction).
@@ -108,7 +123,9 @@ def _maybe_run_guidance(folder, dest_dir):
             meta = json.load(f)
     except (OSError, ValueError):
         return
-    need = ["ambient.jpg", "flash.jpg"]
+    need = ["flash.jpg"]
+    if meta.get("has_ambient", True):        # legacy captures predate the flag
+        need.append("ambient.jpg")
     if meta.get("has_dark"):
         need.append("dark.jpg")
     if not all(os.path.isfile(os.path.join(dest_dir, n)) for n in need):
@@ -120,6 +137,42 @@ def _maybe_run_guidance(folder, dest_dir):
             _sort_capture(folder, dest_dir, category)
     except Exception as e:                       # noqa: BLE001 — never crash receiver
         print(f"  guidance error: {e}")
+
+
+def _maybe_build_mosaic(folder, dest_dir, filename):
+    """Re-stitch a session's red-eye extracts as each new one arrives.
+
+    Fires only on the `*_extract.png` half of each pair (the mask lands
+    separately) and only once there are enough shots.  Wrapped so a stitching
+    failure — perfectly normal when two captures happen not to overlap — never
+    takes the receiver down.
+    """
+    if not (SESSION_AUTO_MOSAIC and filename.endswith("_extract.png")):
+        return
+    try:
+        import mosaic
+        n = len(mosaic.load_session(dest_dir)[0])
+        if n < SESSION_MIN_FOR_MOSAIC:
+            print(f"  session {folder}: {n} capture(s), "
+                  f"need {SESSION_MIN_FOR_MOSAIC} to mosaic")
+            return
+        out = os.path.join(dest_dir, "mosaic.png")
+        mos, info, paths = mosaic.build(dest_dir, out, verbose=False)
+        if mos is None:
+            print(f"  >>> MOSAIC [{folder}]: no reliable alignment across "
+                  f"{len(paths)} capture(s)")
+            return
+        sheet = mosaic.contact_sheet(
+            mosaic.load_session(dest_dir)[0],
+            labels=[os.path.basename(p).replace("_extract.png", "") for p in paths])
+        if sheet is not None:
+            cv2_write = os.path.join(dest_dir, "captures.png")
+            import cv2 as _cv2
+            _cv2.imwrite(cv2_write, sheet)
+        print(f"  >>> MOSAIC [{folder}]: {info['used']}/{len(paths)} stitched "
+              f"({info['detector']}), {mos.shape[1]}x{mos.shape[0]} -> {out}")
+    except Exception as e:                           # noqa: BLE001 — never crash
+        print(f"  mosaic error: {e}")
 
 
 def _run_guidance(folder, dest_dir):
@@ -149,37 +202,57 @@ def _run_guidance(folder, dest_dir):
     if "live_rotation" in meta:
         cap.LIVE_ROTATION = int(meta["live_rotation"])
 
-    amb = np.array(Image.open(os.path.join(dest_dir, "ambient.jpg")).convert("RGB"))
+    amb_path = os.path.join(dest_dir, "ambient.jpg")
+    has_ambient = meta.get("has_ambient", True) and os.path.isfile(amb_path)
     fla = np.array(Image.open(os.path.join(dest_dir, "flash.jpg")).convert("RGB"))
     rot = cap._CV2_ROTATIONS[cap.LIVE_ROTATION]
-    amb_bgr = cv2.cvtColor(amb, cv2.COLOR_RGB2BGR)
     fla_bgr = cv2.cvtColor(fla, cv2.COLOR_RGB2BGR)
     if rot is not None:
-        amb_bgr = cv2.rotate(amb_bgr, rot)
         fla_bgr = cv2.rotate(fla_bgr, rot)
+    amb_bgr = None
+    if has_ambient:
+        amb = np.array(Image.open(amb_path).convert("RGB"))
+        amb_bgr = cv2.cvtColor(amb, cv2.COLOR_RGB2BGR)
+        if rot is not None:
+            amb_bgr = cv2.rotate(amb_bgr, rot)
 
-    cover = cap.load_cover_mask(amb_bgr.shape[:2])
+    cover = cap.load_cover_mask(fla_bgr.shape[:2])
 
-    # Run the two detectors separately and categorise this capture.
-    ridge, ritnet = cap.detect_both(amb_bgr, fla_bgr, cover, _GUIDANCE_PRIOR,
-                                    allow_ml=True)
-    category, chosen = cap.classify_detection(ridge, ritnet, amb_bgr.shape)
+    # Run the two detectors separately and categorise this capture.  Both of them
+    # need the ambient dark-disc frame, which the sweep-triggered dark+flash capture
+    # does not take — those go straight to the red-eye extraction, using the pupil
+    # coords the Pi found live and shipped in meta.
+    if has_ambient:
+        ridge, ritnet = cap.detect_both(amb_bgr, fla_bgr, cover, _GUIDANCE_PRIOR,
+                                        allow_ml=True)
+        category, chosen = cap.classify_detection(ridge, ritnet, fla_bgr.shape)
+    else:
+        ridge = ritnet = chosen = None
+        category = "flash_only"
     center = chosen[0] if chosen else None
     conf = chosen[2] if chosen else 0.0
     source = chosen[3] if chosen else ""
 
     target = guidance.target_point(fla_bgr.shape, cover, GUIDANCE_TARGET_MODE)
-    g = _GUIDANCE.update(center, fla_bgr.shape, target, conf, source)
-    _GUIDANCE_PRIOR = center if center is not None else _GUIDANCE_PRIOR
-
     rs = f"{ridge[2]:.2f}" if ridge else "-"
     ns = f"{ritnet[2]:.2f}" if ritnet else "-"
-    verify = ("  >>> ENDPOINT: aligned or blocked (was at cover edge, now lost)"
-              if g.endpoint else "  [in valid region]" if g.in_valid_region
-              else "  [reached valid region earlier]" if g.reached_valid else "")
-    print(f"  >>> GUIDANCE [{folder}]: {g.instruction}"
-          + (f"  (off={g.distance:.0f}px {source} conf={conf:.2f})" if center else "")
-          + verify)
+    if has_ambient:
+        g = _GUIDANCE.update(center, fla_bgr.shape, target, conf, source)
+        _GUIDANCE_PRIOR = center if center is not None else _GUIDANCE_PRIOR
+        verify = ("  >>> ENDPOINT: aligned or blocked (was at cover edge, now lost)"
+                  if g.endpoint else "  [in valid region]" if g.in_valid_region
+                  else "  [reached valid region earlier]" if g.reached_valid else "")
+        print(f"  >>> GUIDANCE [{folder}]: {g.instruction}"
+              + (f"  (off={g.distance:.0f}px {source} conf={conf:.2f})" if center else "")
+              + verify)
+    else:
+        # No ambient frame => no offline alignment to report; the Pi's live staged
+        # session already decided this was the optimum.  Do NOT feed the session
+        # tracker, or its relative phrasing would be based on a capture it never saw.
+        g = guidance.Guidance(state="sweep",
+                              instruction="Captured at the gaze-sweep peak "
+                                          "(flash + dark only).")
+        print(f"  >>> GUIDANCE [{folder}]: {g.instruction}")
     print(f"  >>> CATEGORY [{folder}]: {category}  (ridge conf={rs}, ritnet conf={ns})")
     vis = guidance.annotate(cv2.convertScaleAbs(fla_bgr, alpha=3.0), g, target, center)
     cv2.imwrite(os.path.join(dest_dir, "guidance.jpg"), vis)
@@ -319,6 +392,8 @@ class UploadHandler(BaseHTTPRequestHandler):
         # the cover mask), not under Transfers/.
         if folder == CALIBRATION_FOLDER:
             dest_dir = CALIBRATION_DIR
+        elif folder.startswith(SESSION_PREFIX):
+            dest_dir = os.path.join(SESSIONS_DIR, folder)
         else:
             dest_dir = os.path.join(TRANSFERS_DIR, folder)
         dest = os.path.join(dest_dir, filename)
@@ -340,6 +415,12 @@ class UploadHandler(BaseHTTPRequestHandler):
         if folder == CALIBRATION_FOLDER and filename == CALIB_IMAGE_NAME:
             _build_cover_mask_from(dest)
         self._reply(200, "ok")        # ack the Pi before any heavy detection
+
+        # Session extracts are raw red-eye patches, not capture triples: they only
+        # get (re)mosaicked, never categorised.
+        if folder.startswith(SESSION_PREFIX):
+            _maybe_build_mosaic(folder, dest_dir, filename)
+            return
 
         # Once the capture triple is complete, run alignment guidance (off the
         # response path so RITnet inference never blocks the upload).

@@ -1,0 +1,19 @@
+{
+  "timestamp": "20260811_223907",
+  "live_rotation": 3,
+  "exposure": 32000,
+  "flash_gain": 1.6,
+  "red_gain": 2.2,
+  "blue_gain": 1.4,
+  "brightness": 2.0,
+  "contrast": 1.0,
+  "swirski_debug": true,
+  "has_both": false,
+  "has_dark": true,
+  "has_ambient": false,
+  "session": "20260811_223109",
+  "pupil_center": [
+    301.6,
+    579.7
+  ]
+}
