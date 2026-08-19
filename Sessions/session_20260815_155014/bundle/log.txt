@@ -1,0 +1,20 @@
+session session_20260815_155014
+  5 capture(s)
+  [load] 0.10s, peak RSS 140.2 MB
+  5/5 passed the quality gate
+  [preprocess] 0.14s, peak RSS 143.1 MB
+  keypoints: total 699, min 115, median 144, max 154
+  [features] 0.13s, peak RSS 140.2 MB
+  10 candidate pair(s), 0 skipped
+  [shortlist] 0.00s, peak RSS 140.2 MB
+  1/10 pair(s) accepted
+    1-4: 7/61 inliers, L0, ncc 0.56
+  [match] 0.83s, peak RSS 140.8 MB
+  0 triangle(s) tested, 0 edge(s) dropped on cycle error
+  1 connected component(s): [2]
+  [graph] 0.00s, peak RSS 140.8 MB
+  component 0 (2 patches): bundle_adjustment
+    BA 17 params, RMS 1.37 -> 1.37 px
+  [global_opt] 0.06s, peak RSS 140.9 MB
+  component 0: 184x106, max stack 2, 9511 covered px
+  [compose] 0.05s, peak RSS 141.0 MB

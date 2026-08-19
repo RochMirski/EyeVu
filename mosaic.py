@@ -850,7 +850,11 @@ def keypoint_sheet(images, masks=None, labels=None, cols=4, tile=260,
               f"max {max(counts)}")
         if weak:
             print(f"    too few to match anything (<{MIN_KEYPOINTS}): {weak}")
-    return contact_sheet(views, cols=cols, tile=tile, labels=labs), labs
+    # crop=False: these views are already in analysis space -- cropped to the
+    # patch and enlarged -- so cropping again would only trim the keypoint
+    # circles that sit near the boundary, which are the ones worth seeing.
+    return contact_sheet(views, cols=cols, tile=tile, labels=labs,
+                         crop=False), labs
 
 
 def show_keypoints(session_dir, out_path=None, show=True, verbose=True):
@@ -876,6 +880,71 @@ def show_keypoints(session_dir, out_path=None, show=True, verbose=True):
         cv2.imshow("Red-eye keypoints", vis)
         cv2.waitKey(1)
     return sheet
+
+
+# ── display-only cropping ─────────────────────────────────────────────────
+# A red-eye extract is a ~45x32 px blob adrift in a 480x640 (or 960x1280) frame
+# -- measured over 141 real captures, the content is a median 0.28% of the
+# frame.  Shown as-is, a viewer is 99.7% black and the thing you actually want
+# to look at is a speck.  Everything below crops to the content for DISPLAY.
+#
+# NOTHING here touches the images used for registration: stitching reads the
+# full frames straight from disk via load_session, and the geometry all works in
+# original frame coordinates.  These helpers are for eyes only.
+
+def patch_view_box(mask, shape, margin=0.25, min_margin=6):
+    """(x0, y0, x1, y1) around a capture's content, with breathing room.
+
+    The margin is proportional so a big patch is not cropped tighter than a
+    small one, with a floor so a tiny patch still gets some context -- the
+    surround is worth seeing, because a reflex touching the edge of its own
+    selection usually means the detection clipped it.
+    """
+    bb = content_bbox(mask)
+    if bb is None:
+        return None
+    x0, y0, w, h = bb
+    m = max(int(min_margin), int(round(float(margin) * max(w, h))))
+    H, W = shape[:2]
+    return (max(0, x0 - m), max(0, y0 - m),
+            min(W, x0 + w + m), min(H, y0 + h + m))
+
+
+def crop_box(img, box):
+    """Apply a `patch_view_box` to an image; None box or image passes through."""
+    if img is None or box is None:
+        return img
+    x0, y0, x1, y1 = box
+    if x1 <= x0 or y1 <= y0:
+        return img
+    return img[y0:y1, x0:x1]
+
+
+def fit_for_display(img, target=560, cap=900, max_zoom=12.0):
+    """Scale a cropped patch up to something you can actually see.
+
+    NEAREST on the way up, deliberately: at the zoom factors involved (a 45 px
+    patch to ~560 px is 12x) interpolation invents detail that is not in the
+    capture, and this is the view an operator judges a reflex by.  Blocky and
+    honest beats smooth and flattering.
+    """
+    if img is None or img.size == 0:
+        return img
+    h, w = img.shape[:2]
+    long_edge = max(h, w)
+    if long_edge <= 0:
+        return img
+    s = min(float(target) / long_edge, float(max_zoom))
+    if s > 1.0:
+        img = cv2.resize(img, (max(1, int(round(w * s))),
+                               max(1, int(round(h * s)))),
+                         interpolation=cv2.INTER_NEAREST)
+    h, w = img.shape[:2]
+    if max(h, w) > cap:
+        s = float(cap) / max(h, w)
+        img = cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))),
+                         interpolation=cv2.INTER_AREA)
+    return img
 
 
 def crop_to_content(img, pad=8):
@@ -910,16 +979,28 @@ def load_session(session_dir):
     return imgs, masks, paths
 
 
-def contact_sheet(images, cols=3, tile=260, labels=None):
-    """Grid of the constituent patches, for eyeballing what went into a mosaic."""
+def contact_sheet(images, cols=3, tile=260, labels=None, crop=True, masks=None):
+    """Grid of the constituent patches, for eyeballing what went into a mosaic.
+
+    `crop` fits each tile to its own patch instead of to the whole frame.  With
+    it off, a 45x32 px blob shrunk into a 260 px tile is about 20 px across and
+    tells you nothing.  Pass crop=False for images that are already tight (the
+    keypoint views, which are in analysis space).
+    """
     if not images:
         return None
     rows = (len(images) + cols - 1) // cols
     sheet = np.zeros((rows * tile, cols * tile, 3), np.uint8)
     for i, im in enumerate(images):
+        if crop and im is not None:
+            m = masks[i] if (masks is not None and i < len(masks)
+                             and masks[i] is not None) else mask_for(im)
+            im = crop_box(im, patch_view_box(m, im.shape))
         h, w = im.shape[:2]
         s = min(tile / max(1, w), tile / max(1, h))
-        rs = cv2.resize(im, (max(1, int(w * s)), max(1, int(h * s))))
+        interp = cv2.INTER_NEAREST if s > 1.0 else cv2.INTER_AREA
+        rs = cv2.resize(im, (max(1, int(w * s)), max(1, int(h * s))),
+                        interpolation=interp)
         r, c = divmod(i, cols)
         y, x = r * tile, c * tile
         sheet[y:y + rs.shape[0], x:x + rs.shape[1]] = rs
@@ -963,13 +1044,15 @@ def browse(session_dir, window="Session captures"):
           f"ESC/q=close")
     try:
         while True:
+            # Crop the extract and the mask to the SAME box, so `m` toggles
+            # between two views of the same thing instead of jumping.
+            m_i = masks[i] if masks[i] is not None else mask_for(imgs[i])
+            box = patch_view_box(m_i, imgs[i].shape)
             if show_mask and masks[i] is not None:
-                vis = cv2.cvtColor(masks[i], cv2.COLOR_GRAY2BGR)
+                vis = cv2.cvtColor(crop_box(masks[i], box), cv2.COLOR_GRAY2BGR)
             else:
-                vis = imgs[i].copy()
-            if vis.shape[0] > 900:
-                s = 900.0 / vis.shape[0]
-                vis = cv2.resize(vis, (int(vis.shape[1] * s), 900))
+                vis = crop_box(imgs[i], box).copy()
+            vis = fit_for_display(vis)
             px = int(cv2.countNonZero(masks[i])) if masks[i] is not None else -1
             label = (f"[{i + 1}/{len(imgs)}] "
                      f"{os.path.basename(paths[i]).replace('_extract.png', '')}"

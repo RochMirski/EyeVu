@@ -1,0 +1,51 @@
+{
+  "bundle_version": 2,
+  "components": [],
+  "compose": {},
+  "error": "Traceback (most recent call last):\n  File \"c:\\Users\\Roch Mirski\\OneDrive - University of Cambridge\\Documents\\GitHub\\Holystone AutoDrone\\EyeVu\\eyevu_mosaic\\run_session.py\", line 189, in run\n    raise RuntimeError(f\"need >= 2 usable captures, have {len(good)}\")\nRuntimeError: need >= 2 usable captures, have 1\n",
+  "graph": {},
+  "optimisation": {},
+  "pairs": [],
+  "patches": [
+    {
+      "accepted": true,
+      "analysis_scale": 1.5,
+      "equiv_radius_px": 46.861710433806955,
+      "index": 0,
+      "n_keypoints": 200,
+      "path": "redeye_01_114943_extract.png",
+      "quality": {
+        "equiv_radius_px": 46.861710433806955,
+        "focus_lapvar": 191.3411407470703,
+        "mask_area_analysis_px": 6899,
+        "mask_area_px": 3066,
+        "mean_luma": 13.737353324890137,
+        "saturated_frac": 0.0
+      },
+      "reason": ""
+    }
+  ],
+  "session_id": "session_20260815_114828",
+  "timings": {
+    "_total": {
+      "peak_rss_mb": 133.8,
+      "seconds": 0.267
+    },
+    "features": {
+      "peak_rss_mb": 133.7,
+      "seconds": 0.064
+    },
+    "load": {
+      "peak_rss_mb": 134.3,
+      "seconds": 0.055
+    },
+    "preprocess": {
+      "peak_rss_mb": 132.7,
+      "seconds": 0.061
+    }
+  },
+  "tracks": {
+    "lengths": [],
+    "n": 0
+  }
+}

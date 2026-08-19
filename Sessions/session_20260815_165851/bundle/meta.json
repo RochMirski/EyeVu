@@ -1,0 +1,457 @@
+{
+  "bundle_version": 2,
+  "capture": {},
+  "config": {
+    "analysis_max_px": 900,
+    "analysis_pad_px": 6.0,
+    "analysis_upsample": 3.0,
+    "ba_ftol": 1e-06,
+    "ba_gtol": 1e-06,
+    "ba_huber_delta": 4.0,
+    "ba_max_iters": 60,
+    "ba_max_level_for_rotation_ba": 1,
+    "ba_max_tracks": 400,
+    "ba_min_track_len": 2,
+    "ba_refine_focal": false,
+    "ba_use_edge_priors": true,
+    "ba_xtol": 1e-06,
+    "blend_mode": "weighted_median",
+    "bundle_adjust": true,
+    "clahe_clip": 5.0,
+    "clahe_tile": 8,
+    "cv_num_threads": 4,
+    "cycle_check": true,
+    "cycle_max_error_px": 18.0,
+    "cycle_min_triangles": 1,
+    "descriptor_dtype": "float16",
+    "direct_align": true,
+    "direct_downscale": 0.5,
+    "direct_ncc_min": 0.66,
+    "direct_roll_range_deg": 8.0,
+    "direct_roll_step_deg": 2.0,
+    "direct_screen_ncc": 0.42,
+    "erode_frac_of_radius": 0.05,
+    "erode_max_px": 8,
+    "erode_min_px": 2,
+    "exposure_normalise": true,
+    "fail_soft": true,
+    "flatten_mode": "poly",
+    "flatten_poly_order": 2,
+    "flatten_sigma_frac": 0.125,
+    "focal_is_calibrated": false,
+    "focal_ref_px": 1200.0,
+    "global_desc_size": 16,
+    "global_outlier_max_drops": 6,
+    "global_outlier_max_px": 25.0,
+    "global_outlier_reject": true,
+    "global_outlier_rounds": 2,
+    "hough_bins_scale": 2.0,
+    "hough_bins_theta_deg": 30.0,
+    "hough_bins_xy": 0.25,
+    "hough_enabled": true,
+    "hough_min_votes": 3,
+    "ladder": {
+      "enabled_max_level": 2,
+      "l1_min_inliers": 6,
+      "l2_min_inliers": 10,
+      "l3_min_inliers": 20,
+      "l4_min_baseline_px": 40.0,
+      "l4_min_inliers": 35,
+      "residual_gain": 0.2
+    },
+    "lowe_ratio": 0.98,
+    "lru_cache_patches": 8,
+    "max_keypoints": 300,
+    "max_mask_area_px": 60000,
+    "max_mean_luma": 250.0,
+    "max_rotation_deg": 60.0,
+    "max_saturated_frac": 0.35,
+    "min_focus_lapvar": 3.0,
+    "min_inlier_frac": 0.02,
+    "min_inliers": 3,
+    "min_keypoints": 6,
+    "min_mask_area_px": 150,
+    "min_mean_luma": 8.0,
+    "min_overlap_frac": 0.1,
+    "min_overlap_px": 400,
+    "min_putative": 4,
+    "mutual_nn": true,
+    "ncc_min": 0.5,
+    "outline_dim": 0.35,
+    "outline_thickness": 1,
+    "output_margin_frac": 0.05,
+    "output_max_px": 4000,
+    "output_scale": 1.0,
+    "preview_max_px": 1200,
+    "projection": "azimuthal_equidistant",
+    "prosac_growth": 0.25,
+    "ransac_confidence": 0.995,
+    "ransac_max_iters": 1500,
+    "ransac_reproj_px": 6.0,
+    "ref_frame_width": 480,
+    "rootsift": true,
+    "shortlist_all_below_n": 25,
+    "shortlist_random_k": 4,
+    "shortlist_seed": 0,
+    "shortlist_top_k": 12,
+    "sift_contrast_threshold": 0.01,
+    "sift_edge_threshold": 12.0,
+    "specular_dilate_px": 3,
+    "specular_thresh": 250,
+    "spread_grid": 6,
+    "spread_mode": "anms",
+    "spread_per_bucket": 12,
+    "tile_px": 512,
+    "write_outlined_mosaic": true
+  },
+  "fixation_targets": null,
+  "intrinsics": {
+    "calibrated": false,
+    "focal_ref_px": 1200.0,
+    "note": "UNCALIBRATED placeholder.  At current patch size the projective terms of K R K^-1 are ~3e-4 px, so L0 is numerically a Euclidean transform and this value has almost no influence.  It matters once patches grow.",
+    "per_patch": {
+      "0": {
+        "analysis_scale": 3.0,
+        "centre": [
+          72.0,
+          87.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      },
+      "1": {
+        "analysis_scale": 3.0,
+        "centre": [
+          69.0,
+          99.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      },
+      "10": {
+        "analysis_scale": 3.0,
+        "centre": [
+          72.0,
+          105.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      },
+      "11": {
+        "analysis_scale": 3.0,
+        "centre": [
+          69.0,
+          102.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      },
+      "12": {
+        "analysis_scale": 1.5,
+        "centre": [
+          87.0,
+          120.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          1280,
+          960
+        ]
+      },
+      "2": {
+        "analysis_scale": 3.0,
+        "centre": [
+          66.0,
+          120.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      },
+      "3": {
+        "analysis_scale": 3.0,
+        "centre": [
+          78.0,
+          132.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      },
+      "4": {
+        "analysis_scale": 3.0,
+        "centre": [
+          63.0,
+          99.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      },
+      "5": {
+        "analysis_scale": 3.0,
+        "centre": [
+          54.0,
+          99.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      },
+      "6": {
+        "analysis_scale": 3.0,
+        "centre": [
+          69.0,
+          102.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      },
+      "7": {
+        "analysis_scale": 3.0,
+        "centre": [
+          66.0,
+          93.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      },
+      "8": {
+        "analysis_scale": 3.0,
+        "centre": [
+          66.0,
+          93.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      },
+      "9": {
+        "analysis_scale": 3.0,
+        "centre": [
+          66.0,
+          99.0
+        ],
+        "focal_analysis_px": 3600.0,
+        "frame_shape": [
+          640,
+          480
+        ]
+      }
+    },
+    "ref_frame_width": 480
+  },
+  "patches": [
+    {
+      "bbox": [
+        216,
+        291,
+        42,
+        27
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 0,
+      "path": "redeye_01_165923_extract.png"
+    },
+    {
+      "bbox": [
+        217,
+        287,
+        43,
+        30
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 1,
+      "path": "redeye_02_165926_extract.png"
+    },
+    {
+      "bbox": [
+        218,
+        280,
+        42,
+        33
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 2,
+      "path": "redeye_03_165929_extract.png"
+    },
+    {
+      "bbox": [
+        214,
+        276,
+        50,
+        39
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 3,
+      "path": "redeye_04_165931_extract.png"
+    },
+    {
+      "bbox": [
+        219,
+        287,
+        44,
+        29
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 4,
+      "path": "redeye_05_165935_extract.png"
+    },
+    {
+      "bbox": [
+        222,
+        287,
+        39,
+        27
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 5,
+      "path": "redeye_06_165937_extract.png"
+    },
+    {
+      "bbox": [
+        217,
+        286,
+        44,
+        30
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 6,
+      "path": "redeye_07_165940_extract.png"
+    },
+    {
+      "bbox": [
+        218,
+        289,
+        40,
+        29
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 7,
+      "path": "redeye_08_165942_extract.png"
+    },
+    {
+      "bbox": [
+        218,
+        289,
+        40,
+        30
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 8,
+      "path": "redeye_09_165947_extract.png"
+    },
+    {
+      "bbox": [
+        218,
+        287,
+        41,
+        27
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 9,
+      "path": "redeye_10_165954_extract.png"
+    },
+    {
+      "bbox": [
+        216,
+        285,
+        43,
+        33
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 10,
+      "path": "redeye_11_165956_extract.png"
+    },
+    {
+      "bbox": [
+        217,
+        286,
+        45,
+        29
+      ],
+      "frame_shape": [
+        640,
+        480
+      ],
+      "index": 11,
+      "path": "redeye_12_165958_extract.png"
+    },
+    {
+      "bbox": [
+        422,
+        560,
+        109,
+        83
+      ],
+      "frame_shape": [
+        1280,
+        960
+      ],
+      "index": 12,
+      "path": "redeye_13_170005_extract.png"
+    }
+  ],
+  "session_id": "session_20260815_165851"
+}

@@ -1,0 +1,40 @@
+session session_20260815_214652
+  40 capture(s)
+  [load] 0.46s, peak RSS 194.5 MB
+  40/40 passed the quality gate
+  [preprocess] 0.33s, peak RSS 210.5 MB
+  keypoints: total 4813, min 50, median 116, max 215
+  [features] 0.48s, peak RSS 216.7 MB
+  480 candidate pair(s), 300 skipped
+  [shortlist] 0.02s, peak RSS 216.7 MB
+  48/480 pair(s) accepted
+    3-4: 20/58 inliers, L0, ncc 0.86
+    3-36: 20/43 inliers, L0, ncc 0.80
+    3-8: 19/63 inliers, L0, ncc 0.87
+    9-11: 19/52 inliers, L0, ncc 0.75
+    9-10: 18/62 inliers, L0, ncc 0.79
+    4-8: 17/58 inliers, L0, ncc 0.77
+    1-35: 16/61 inliers, L0, ncc 0.79
+    4-36: 16/49 inliers, L0, ncc 0.76
+    9-35: 14/52 inliers, L0, ncc 0.60
+    10-11: 14/44 inliers, L0, ncc 0.83
+  [match] 41.88s, peak RSS 217.5 MB
+  31 triangle(s) tested, 7 edge(s) dropped on cycle error
+  4 connected component(s): [16, 5, 3, 3]
+  [graph] 0.28s, peak RSS 217.5 MB
+  component 0 (16 patches): bundle_adjustment
+    edge [1, 8] residual 44.4px dropped
+    BA 341 params, RMS 2.96 -> 3.39 px
+  component 1 (5 patches): bundle_adjustment
+    BA 40 params, RMS 1.14 -> 1.14 px
+  component 2 (3 patches): bundle_adjustment
+    BA 6 params, RMS nan -> nan px
+  component 3 (3 patches): bundle_adjustment
+    BA 38 params, RMS 4.96 -> 1.13 px
+  [global_opt] 65.50s, peak RSS 150.0 MB
+  component 0: 271x238, max stack 16, 34050 covered px
+  component 1: 230x166, max stack 5, 21376 covered px
+  component 2: 217x141, max stack 3, 15550 covered px
+  component 3: 154x128, max stack 3, 10631 covered px
+  [compose] 2.06s, peak RSS 157.9 MB
+  WARNING: 4 disconnected group(s). Emitting one mosaic each; they cannot be placed relative to one another without a calibrated gaze prior.

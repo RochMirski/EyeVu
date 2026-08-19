@@ -238,13 +238,15 @@ def load_capture(folder: str):
     return ambient, flash, both, meta
 
 
-def context_for_folder(folder: str) -> Optional[DetectionContext]:
-    """Convenience: load a capture folder and build its context, or None."""
-    loaded = load_capture(folder)
-    if loaded is None:
-        return None
-    ambient, flash, both, meta = loaded
-    return build_context(ambient, flash, both, meta)
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def context_for_folder(folder: str) -> Optional[DetectionContext]:
+#     """Convenience: load a capture folder and build its context, or None."""
+#     loaded = load_capture(folder)
+#     if loaded is None:
+#         return None
+#     ambient, flash, both, meta = loaded
+#     return build_context(ambient, flash, both, meta)
 
 
 def find_capture_folders() -> "list[str]":

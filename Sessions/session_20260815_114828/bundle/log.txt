@@ -1,0 +1,12 @@
+session session_20260815_114828
+  1 capture(s)
+  [load] 0.06s, peak RSS 134.3 MB
+  1/1 passed the quality gate
+  [preprocess] 0.06s, peak RSS 132.7 MB
+  keypoints: total 200, min 200, median 200, max 200
+  [features] 0.06s, peak RSS 133.7 MB
+PIPELINE ERROR:
+Traceback (most recent call last):
+  File "c:\Users\Roch Mirski\OneDrive - University of Cambridge\Documents\GitHub\Holystone AutoDrone\EyeVu\eyevu_mosaic\run_session.py", line 189, in run
+    raise RuntimeError(f"need >= 2 usable captures, have {len(good)}")
+RuntimeError: need >= 2 usable captures, have 1

@@ -51,27 +51,31 @@ def lens_forward(focal_length, h, grad):
 
   return d, grad
 
-def lens_backward(focal_length, h, grad):
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def lens_backward(focal_length, h, grad):
 
-  d = -h/grad
+#   d = -h/grad
 
-  s = 1/(1/focal_length - 1/d)
+#   s = 1/(1/focal_length - 1/d)
 
-  grad = h/s
+#   grad = h/s
 
-  return -s, grad
+#   return -s, grad
 
-def calc_eye_pos(x_int, grad, x_cent, D):
-    a = 1 + grad**2
-    b = -2 * (x_cent + grad**2 * x_int)
-    c = x_cent**2 + (grad*x_int)**2-(D**2)/4
-    determinant = b**2 - 4*a*c
-    if determinant < 0:
-        return
-    x_circ = (-b - np.sqrt(determinant))/(2*a)
-    y_circ = -grad*(x_int-x_circ)
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def calc_eye_pos(x_int, grad, x_cent, D):
+#     a = 1 + grad**2
+#     b = -2 * (x_cent + grad**2 * x_int)
+#     c = x_cent**2 + (grad*x_int)**2-(D**2)/4
+#     determinant = b**2 - 4*a*c
+#     if determinant < 0:
+#         return
+#     x_circ = (-b - np.sqrt(determinant))/(2*a)
+#     y_circ = -grad*(x_int-x_circ)
 
-    return [x_circ, y_circ]
+#     return [x_circ, y_circ]
 
 
 def half_angle_theta_from_FOV(FOV, D):

@@ -1,0 +1,32 @@
+session session_20260815_224337
+  10 capture(s)
+  [load] 0.46s, peak RSS 212.8 MB
+  10/10 passed the quality gate
+  [preprocess] 0.16s, peak RSS 220.2 MB
+  keypoints: total 1879, min 126, median 170, max 300
+  [features] 0.22s, peak RSS 175.2 MB
+  45 candidate pair(s), 0 skipped
+  [shortlist] 0.00s, peak RSS 175.2 MB
+  9/45 pair(s) accepted
+    8-9: 17/70 inliers, L0, ncc 0.70
+    5-6: 16/69 inliers, L0, ncc 0.76
+    0-8: 13/93 inliers, L0, ncc 0.61
+    1-4: 11/60 inliers, L0, ncc 0.53
+    0-9: 9/99 inliers, L0, ncc 0.54
+    5-7: 6/66 inliers, L0, ncc 0.59
+    0-4: 0/94 inliers, L0, ncc 0.74
+    1-9: 0/61 inliers, L0, ncc 0.71
+    3-4: 0/56 inliers, L0, ncc 0.71
+  [match] 4.17s, peak RSS 185.5 MB
+  1 triangle(s) tested, 0 edge(s) dropped on cycle error
+  2 connected component(s): [6, 3]
+  [graph] 0.00s, peak RSS 185.5 MB
+  component 0 (6 patches): bundle_adjustment
+    BA 107 params, RMS 3.71 -> 1.48 px
+  component 1 (3 patches): bundle_adjustment
+    BA 48 params, RMS 1.04 -> 1.04 px
+  [global_opt] 4.38s, peak RSS 186.2 MB
+  component 0: 267x206, max stack 6, 25943 covered px
+  component 1: 155x128, max stack 3, 10355 covered px
+  [compose] 0.57s, peak RSS 201.0 MB
+  WARNING: 2 disconnected group(s). Emitting one mosaic each; they cannot be placed relative to one another without a calibrated gaze prior.

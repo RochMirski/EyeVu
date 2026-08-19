@@ -1,0 +1,29 @@
+session session_20260815_165851
+  13 capture(s)
+  [load] 0.30s, peak RSS 170.0 MB
+  13/13 passed the quality gate
+  [preprocess] 0.16s, peak RSS 173.4 MB
+  keypoints: total 1494, min 74, median 101, max 297
+  [features] 0.19s, peak RSS 170.6 MB
+  78 candidate pair(s), 0 skipped
+  [shortlist] 0.00s, peak RSS 170.6 MB
+  14/78 pair(s) accepted
+    4-5: 10/41 inliers, L0, ncc 0.76
+    9-10: 8/43 inliers, L0, ncc 0.57
+    10-11: 8/45 inliers, L0, ncc 0.71
+    4-10: 6/42 inliers, L0, ncc 0.57
+    5-11: 5/39 inliers, L0, ncc 0.52
+    2-5: 0/36 inliers, L0, ncc 0.74
+    2-7: 0/37 inliers, L0, ncc 0.66
+    2-9: 0/35 inliers, L0, ncc 0.68
+    2-10: 0/40 inliers, L0, ncc 0.68
+    4-6: 0/36 inliers, L0, ncc 0.67
+  [match] 8.26s, peak RSS 170.4 MB
+  10 triangle(s) tested, 0 edge(s) dropped on cycle error
+  1 connected component(s): [8]
+  [graph] 0.01s, peak RSS 170.4 MB
+  component 0 (8 patches): bundle_adjustment
+    BA 87 params, RMS 1.10 -> 1.28 px
+  [global_opt] 26.11s, peak RSS 172.8 MB
+  component 0: 173x139, max stack 8, 14268 covered px
+  [compose] 0.27s, peak RSS 173.9 MB

@@ -359,6 +359,69 @@ def test_winner_is_rendered_at_full_upscale():
 
 # ── keypoint visualisation ──
 
+# ── display-only cropping ──
+# A real extract is a ~45x32 px blob in a 480x640 frame (0.28% of it), so the
+# viewers crop to the content.  These pin down that it is DISPLAY ONLY.
+
+def test_patch_view_box_surrounds_the_content():
+    frame, mask = _capture(243, 208)
+    box = mosaic.patch_view_box(mask, frame.shape)
+    x0, y0, x1, y1 = box
+    bb = mosaic.content_bbox(mask)
+    assert x0 <= bb[0] and y0 <= bb[1]
+    assert x1 >= bb[0] + bb[2] and y1 >= bb[1] + bb[3]
+    # ...and stays inside the frame.
+    assert 0 <= x0 < x1 <= frame.shape[1]
+    assert 0 <= y0 < y1 <= frame.shape[0]
+
+
+def test_cropping_raises_the_share_of_the_view_that_is_content():
+    frame, mask = _capture(243, 208)
+    before = (mask > 0).mean()
+    cm = mosaic.crop_box(mask, mosaic.patch_view_box(mask, frame.shape))
+    after = (cm > 0).mean()
+    assert after > 10 * before
+
+
+def test_crop_box_and_view_box_handle_an_empty_mask():
+    frame = np.zeros((640, 480, 3), np.uint8)
+    empty = np.zeros((640, 480), np.uint8)
+    assert mosaic.patch_view_box(empty, frame.shape) is None
+    assert mosaic.crop_box(frame, None) is frame
+
+
+def test_fit_for_display_enlarges_small_patches_but_caps_them():
+    small = np.zeros((30, 40, 3), np.uint8)
+    out = mosaic.fit_for_display(small, target=560)
+    assert max(out.shape[:2]) > 300
+    huge = np.zeros((4000, 3000, 3), np.uint8)
+    assert max(mosaic.fit_for_display(huge, cap=900).shape[:2]) <= 900
+
+
+def test_contact_sheet_cropping_does_not_change_the_canvas():
+    imgs, masks = _session()
+    a = mosaic.contact_sheet(imgs, cols=4, crop=False)
+    b = mosaic.contact_sheet(imgs, cols=4, masks=masks)
+    assert a.shape == b.shape
+    # ...but fills far more of it.
+    def fill(s):
+        return (cv2.cvtColor(s, cv2.COLOR_BGR2GRAY) > 8).mean()
+    assert fill(b) > 3 * fill(a)
+
+
+def test_display_cropping_does_not_affect_registration():
+    """The whole point: viewers crop, the stitcher does not see it."""
+    imgs, masks = _session()
+    mos, info = mosaic.stitch(imgs, masks, verbose=False)
+    # Cropping the inputs for display must not have mutated them.
+    for im, m in zip(imgs, masks):
+        mosaic.crop_box(im, mosaic.patch_view_box(m, im.shape))
+    mos2, info2 = mosaic.stitch(imgs, masks, verbose=False)
+    assert info["used"] == info2["used"]
+    assert info["pieces"] == info2["pieces"]
+    assert np.array_equal(mos, mos2)
+
+
 def test_keypoint_view_draws_something():
     f, m = _capture(*CHAIN[2])
     vis, n = mosaic.keypoint_view(f, m)

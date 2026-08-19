@@ -554,70 +554,74 @@ def _dbg(name, img):
     PUPIL_DEBUG_STAGES.append((name, out))
 
 
-def _find_led_cover_mask(gray):
-    """Locate the dark flash-LED cover so detection can ignore it.
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _find_led_cover_mask(gray):
+#     """Locate the dark flash-LED cover so detection can ignore it.
 
-    The cover is the only large, near-black region that touches the frame
-    border.  A pupil is neither large nor border-touching, so it can never be
-    matched here.  Returns a uint8 mask of the cover, or None if none qualifies.
-    """
-    h, w = gray.shape[:2]
-    dark = (gray < _LED_DARK_THRESH).astype(np.uint8)
-    if int(dark.sum()) == 0:
-        return None
+#     The cover is the only large, near-black region that touches the frame
+#     border.  A pupil is neither large nor border-touching, so it can never be
+#     matched here.  Returns a uint8 mask of the cover, or None if none qualifies.
+#     """
+#     h, w = gray.shape[:2]
+#     dark = (gray < _LED_DARK_THRESH).astype(np.uint8)
+#     if int(dark.sum()) == 0:
+#         return None
 
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark)
-    min_area = _LED_MIN_AREA_FRAC * h * w
-    mask = np.zeros((h, w), dtype=np.uint8)
-    found = False
-    for lbl in range(1, n):
-        x  = stats[lbl, cv2.CC_STAT_LEFT]
-        y  = stats[lbl, cv2.CC_STAT_TOP]
-        bw = stats[lbl, cv2.CC_STAT_WIDTH]
-        bh = stats[lbl, cv2.CC_STAT_HEIGHT]
-        area = stats[lbl, cv2.CC_STAT_AREA]
-        touches_border = (x == 0 or y == 0 or x + bw == w or y + bh == h)
-        if touches_border and area > min_area:
-            mask[labels == lbl] = 255
-            found = True
+#     n, labels, stats, _ = cv2.connectedComponentsWithStats(dark)
+#     min_area = _LED_MIN_AREA_FRAC * h * w
+#     mask = np.zeros((h, w), dtype=np.uint8)
+#     found = False
+#     for lbl in range(1, n):
+#         x  = stats[lbl, cv2.CC_STAT_LEFT]
+#         y  = stats[lbl, cv2.CC_STAT_TOP]
+#         bw = stats[lbl, cv2.CC_STAT_WIDTH]
+#         bh = stats[lbl, cv2.CC_STAT_HEIGHT]
+#         area = stats[lbl, cv2.CC_STAT_AREA]
+#         touches_border = (x == 0 or y == 0 or x + bw == w or y + bh == h)
+#         if touches_border and area > min_area:
+#             mask[labels == lbl] = 255
+#             found = True
 
-    if not found:
-        return None
-    # If the total dark border-region is implausibly large, the cover has fused
-    # with the eye-socket shadow and dark iris into one mass.  Blanking it would
-    # erase the pupil's lighter surround (and the pupil itself), so treat it as
-    # "no reliable cover" and skip exclusion entirely.
-    if int(mask.sum()) / 255 > _LED_MAX_AREA_FRAC * h * w:
-        return None
-    # grow slightly — the out-of-focus cover has a soft, fuzzy edge
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    return cv2.dilate(mask, k)
+#     if not found:
+#         return None
+#     # If the total dark border-region is implausibly large, the cover has fused
+#     # with the eye-socket shadow and dark iris into one mass.  Blanking it would
+#     # erase the pupil's lighter surround (and the pupil itself), so treat it as
+#     # "no reliable cover" and skip exclusion entirely.
+#     if int(mask.sum()) / 255 > _LED_MAX_AREA_FRAC * h * w:
+#         return None
+#     # grow slightly — the out-of-focus cover has a soft, fuzzy edge
+#     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+#     return cv2.dilate(mask, k)
 
 
-def _apply_exclusions(gray):
-    """Return a copy of `gray` with the flash-LED cover blanked to white.
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _apply_exclusions(gray):
+#     """Return a copy of `gray` with the flash-LED cover blanked to white.
 
-    The cover is a large, border-touching, near-black blob that can intrude
-    from any edge of the (rotated) frame.  Its 2D mask is whited out (255) so
-    it can never be mistaken for a dark pupil — no assumption is made about
-    which edge it enters from.
+#     The cover is a large, border-touching, near-black blob that can intrude
+#     from any edge of the (rotated) frame.  Its 2D mask is whited out (255) so
+#     it can never be mistaken for a dark pupil — no assumption is made about
+#     which edge it enters from.
 
-    If no LED cover is detected, the optional manual DETECT_EXCLUDE_BOTTOM band
-    is used as a fallback.
-    """
-    h = gray.shape[0]
-    g = gray.copy()
+#     If no LED cover is detected, the optional manual DETECT_EXCLUDE_BOTTOM band
+#     is used as a fallback.
+#     """
+#     h = gray.shape[0]
+#     g = gray.copy()
 
-    cover = _find_led_cover_mask(g)
-    if cover is not None:
-        g[cover > 0] = 255                     # white-out the cover, wherever it is
-        return g
+#     cover = _find_led_cover_mask(g)
+#     if cover is not None:
+#         g[cover > 0] = 255                     # white-out the cover, wherever it is
+#         return g
 
-    # fallback — no LED cover found: optional manual bottom band only
-    if DETECT_EXCLUDE_BOTTOM > 0:
-        y_ex = int(h * (1.0 - min(0.9, DETECT_EXCLUDE_BOTTOM)))
-        g[y_ex:, :] = 255
-    return g
+#     # fallback — no LED cover found: optional manual bottom band only
+#     if DETECT_EXCLUDE_BOTTOM > 0:
+#         y_ex = int(h * (1.0 - min(0.9, DETECT_EXCLUDE_BOTTOM)))
+#         g[y_ex:, :] = 255
+#     return g
 
 
 # ── LED-cover calibration: build / save / load a fixed cover mask ──
@@ -1408,100 +1412,110 @@ def _swirski_coarse(gray, rmin, rmax):
     return best
 
 
-def _enhance_contrast(gray):
-    """Apply CLAHE to lift the pupil/iris edge out of the eye-socket shadow."""
-    clahe = cv2.createCLAHE(clipLimit=_CLAHE_CLIP,
-                            tileGridSize=(_CLAHE_TILE, _CLAHE_TILE))
-    return clahe.apply(gray)
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _enhance_contrast(gray):
+#     """Apply CLAHE to lift the pupil/iris edge out of the eye-socket shadow."""
+#     clahe = cv2.createCLAHE(clipLimit=_CLAHE_CLIP,
+#                             tileGridSize=(_CLAHE_TILE, _CLAHE_TILE))
+#     return clahe.apply(gray)
 
 
-def _orlosky_seed(gray):
-    """Coarse seed for the Orlosky pipeline.
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _orlosky_seed(gray):
+#     """Coarse seed for the Orlosky pipeline.
 
-    Prefers the Swirski Haar dark-centre/light-surround response; falls back to
-    the plain darkest-area search if no Haar response is found.  Returns
-    (cx, cy, r) — r is None for the darkest-area fallback.
-    """
-    h, w = gray.shape[:2]
-    rmin = _SW_MIN_R_FRAC * min(h, w)
-    rmax = _SW_MAX_R_FRAC * min(h, w)
-    coarse = _swirski_coarse(gray, rmin, rmax)
-    if coarse is not None:
-        return coarse
-    darkest = _orlosky_darkest_area(gray)
-    if darkest is None:
-        return None
-    return (darkest[0], darkest[1], None)
-
-
-def _orlosky_darkest_area(gray):
-    """Coarse stage — return (x, y) of the centre of the darkest small region.
-
-    Equivalent to Orlosky's sparse darkest-area search, done here with a
-    box-filter local mean + minMaxLoc for speed.
-    """
-    win = _ORL_DARKEST_WIN
-    blurred = cv2.boxFilter(gray, -1, (win, win),
-                            normalize=True, borderType=cv2.BORDER_REPLICATE)
-    h, w = gray.shape[:2]
-    b = win
-    if h > 2 * b and w > 2 * b:
-        roi = blurred[b:h - b, b:w - b]
-        ox, oy = b, b
-    else:
-        roi = blurred
-        ox, oy = 0, 0
-    _minv, _maxv, min_loc, _maxloc = cv2.minMaxLoc(roi)
-    return (min_loc[0] + ox, min_loc[1] + oy)
+#     Prefers the Swirski Haar dark-centre/light-surround response; falls back to
+#     the plain darkest-area search if no Haar response is found.  Returns
+#     (cx, cy, r) — r is None for the darkest-area fallback.
+#     """
+#     h, w = gray.shape[:2]
+#     rmin = _SW_MIN_R_FRAC * min(h, w)
+#     rmax = _SW_MAX_R_FRAC * min(h, w)
+#     coarse = _swirski_coarse(gray, rmin, rmax)
+#     if coarse is not None:
+#         return coarse
+#     darkest = _orlosky_darkest_area(gray)
+#     if darkest is None:
+#         return None
+#     return (darkest[0], darkest[1], None)
 
 
-def _mask_outside_square(image, center, size):
-    """Zero every pixel outside a `size`×`size` square centred on `center`."""
-    x, y = center
-    half = size // 2
-    mask = np.zeros_like(image)
-    x0 = max(0, x - half)
-    y0 = max(0, y - half)
-    x1 = min(image.shape[1], x + half)
-    y1 = min(image.shape[0], y + half)
-    mask[y0:y1, x0:x1] = 255
-    return cv2.bitwise_and(image, mask)
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _orlosky_darkest_area(gray):
+#     """Coarse stage — return (x, y) of the centre of the darkest small region.
+
+#     Equivalent to Orlosky's sparse darkest-area search, done here with a
+#     box-filter local mean + minMaxLoc for speed.
+#     """
+#     win = _ORL_DARKEST_WIN
+#     blurred = cv2.boxFilter(gray, -1, (win, win),
+#                             normalize=True, borderType=cv2.BORDER_REPLICATE)
+#     h, w = gray.shape[:2]
+#     b = win
+#     if h > 2 * b and w > 2 * b:
+#         roi = blurred[b:h - b, b:w - b]
+#         ox, oy = b, b
+#     else:
+#         roi = blurred
+#         ox, oy = 0, 0
+#     _minv, _maxv, min_loc, _maxloc = cv2.minMaxLoc(roi)
+#     return (min_loc[0] + ox, min_loc[1] + oy)
 
 
-def _orlosky_contours(gray):
-    """Run the Orlosky pipeline on an exclusion-masked grayscale image:
-    Haar coarse seed → relative threshold → ROI mask → dilate → contours.
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _mask_outside_square(image, center, size):
+#     """Zero every pixel outside a `size`×`size` square centred on `center`."""
+#     x, y = center
+#     half = size // 2
+#     mask = np.zeros_like(image)
+#     x0 = max(0, x - half)
+#     y0 = max(0, y - half)
+#     x1 = min(image.shape[1], x + half)
+#     y1 = min(image.shape[0], y + half)
+#     mask[y0:y1, x0:x1] = 255
+#     return cv2.bitwise_and(image, mask)
 
-    Returns (contours, seed_point)."""
-    seed = _orlosky_seed(gray)
-    if seed is None:
-        return [], None
-    sx, sy, r = seed
 
-    h, w = gray.shape[:2]
-    # threshold value from the darkest pixel in a small patch around the seed,
-    # not the global darkest pixel (which may sit in residual shadow)
-    win = int(r * _ORL_SEED_WIN_MULT) if r else _ORL_DARKEST_WIN
-    win = max(2, win)
-    x0 = max(0, sx - win); x1 = min(w, sx + win + 1)
-    y0 = max(0, sy - win); y1 = min(h, sy + win + 1)
-    patch = gray[y0:y1, x0:x1]
-    dval = int(patch.min()) if patch.size else int(gray[sy, sx])
-    thresh = dval + _ORL_THRESHOLD_OFFSET
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _orlosky_contours(gray):
+#     """Run the Orlosky pipeline on an exclusion-masked grayscale image:
+#     Haar coarse seed → relative threshold → ROI mask → dilate → contours.
 
-    # dark pupil → white
-    _, binary = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY_INV)
-    # keep only a square ROI around the seed — sized from the seed radius when
-    # available, else the fixed fraction of the frame
-    roi_side = int(r * _ORL_ROI_R_MULT) if r else int(_ORL_MASK_FRAC * min(h, w))
-    binary = _mask_outside_square(binary, (sx, sy), roi_side)
-    # dilate to close the pupil blob
-    kernel = np.ones((_ORL_DILATE_KERNEL, _ORL_DILATE_KERNEL), np.uint8)
-    binary = cv2.dilate(binary, kernel, iterations=_ORL_DILATE_ITERS)
+#     Returns (contours, seed_point)."""
+#     seed = _orlosky_seed(gray)
+#     if seed is None:
+#         return [], None
+#     sx, sy, r = seed
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    return contours, seed
+#     h, w = gray.shape[:2]
+#     # threshold value from the darkest pixel in a small patch around the seed,
+#     # not the global darkest pixel (which may sit in residual shadow)
+#     win = int(r * _ORL_SEED_WIN_MULT) if r else _ORL_DARKEST_WIN
+#     win = max(2, win)
+#     x0 = max(0, sx - win); x1 = min(w, sx + win + 1)
+#     y0 = max(0, sy - win); y1 = min(h, sy + win + 1)
+#     patch = gray[y0:y1, x0:x1]
+#     dval = int(patch.min()) if patch.size else int(gray[sy, sx])
+#     thresh = dval + _ORL_THRESHOLD_OFFSET
+
+#     # dark pupil → white
+#     _, binary = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY_INV)
+#     # keep only a square ROI around the seed — sized from the seed radius when
+#     # available, else the fixed fraction of the frame
+#     roi_side = int(r * _ORL_ROI_R_MULT) if r else int(_ORL_MASK_FRAC * min(h, w))
+#     binary = _mask_outside_square(binary, (sx, sy), roi_side)
+#     # dilate to close the pupil blob
+#     kernel = np.ones((_ORL_DILATE_KERNEL, _ORL_DILATE_KERNEL), np.uint8)
+#     binary = cv2.dilate(binary, kernel, iterations=_ORL_DILATE_ITERS)
+
+#     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+#                                    cv2.CHAIN_APPROX_SIMPLE)
+#     return contours, seed
 
 
 def _inpaint_reflections(gray, mask=None):
@@ -1596,131 +1610,137 @@ def _find_corneal_reflex(gray):
     return best[0], best[1], best[2], blob_mask
 
 
-def _segment_pupil_at(gray, cx, cy, rmin, rmax):
-    """Build the pupil mask in an ROI centred on the (reflex) anchor.
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _segment_pupil_at(gray, cx, cy, rmin, rmax):
+#     """Build the pupil mask in an ROI centred on the (reflex) anchor.
 
-    Relative-thresholds the ROI at (local-darkest + offset), inverts so the dark
-    pupil becomes white, cleans it morphologically and keeps the connected
-    component under the anchor.  Deliberately does NOT reject border-touching or
-    low-solidity blobs: when the dark occluder patch merges with the pupil the
-    blob is irregular, and it is the gradient-aware RANSAC fit downstream that
-    recovers the true pupil ellipse from the visible iris-side arc.
+#     Relative-thresholds the ROI at (local-darkest + offset), inverts so the dark
+#     pupil becomes white, cleans it morphologically and keeps the connected
+#     component under the anchor.  Deliberately does NOT reject border-touching or
+#     low-solidity blobs: when the dark occluder patch merges with the pupil the
+#     blob is irregular, and it is the gradient-aware RANSAC fit downstream that
+#     recovers the true pupil ellipse from the visible iris-side arc.
 
-    Returns (mask, x0, y0) — mask in ROI coords, ROI top-left in `gray` — or None.
-    """
-    h, w = gray.shape[:2]
-    half = max(20, int(rmax * _PUPIL_ROI_R_MULT))
-    x0 = max(0, cx - half); x1 = min(w, cx + half)
-    y0 = max(0, cy - half); y1 = min(h, cy + half)
-    roi = gray[y0:y1, x0:x1]
-    if roi.size == 0 or min(roi.shape[:2]) < 10:
-        return None
+#     Returns (mask, x0, y0) — mask in ROI coords, ROI top-left in `gray` — or None.
+#     """
+#     h, w = gray.shape[:2]
+#     half = max(20, int(rmax * _PUPIL_ROI_R_MULT))
+#     x0 = max(0, cx - half); x1 = min(w, cx + half)
+#     y0 = max(0, cy - half); y1 = min(h, cy + half)
+#     roi = gray[y0:y1, x0:x1]
+#     if roi.size == 0 or min(roi.shape[:2]) < 10:
+#         return None
 
-    roi_b = cv2.GaussianBlur(roi, (5, 5), 0)
-    lx, ly = cx - x0, cy - y0
-    win = max(4, int(rmin))
-    px0 = max(0, lx - win); px1 = min(roi.shape[1], lx + win + 1)
-    py0 = max(0, ly - win); py1 = min(roi.shape[0], ly + win + 1)
-    patch = roi_b[py0:py1, px0:px1]
-    dval = int(patch.min()) if patch.size else int(roi_b[ly, lx])
-    thresh = dval + _ORL_THRESHOLD_OFFSET
+#     roi_b = cv2.GaussianBlur(roi, (5, 5), 0)
+#     lx, ly = cx - x0, cy - y0
+#     win = max(4, int(rmin))
+#     px0 = max(0, lx - win); px1 = min(roi.shape[1], lx + win + 1)
+#     py0 = max(0, ly - win); py1 = min(roi.shape[0], ly + win + 1)
+#     patch = roi_b[py0:py1, px0:px1]
+#     dval = int(patch.min()) if patch.size else int(roi_b[ly, lx])
+#     thresh = dval + _ORL_THRESHOLD_OFFSET
 
-    _, mask = cv2.threshold(roi_b, thresh, 255, cv2.THRESH_BINARY_INV)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+#     _, mask = cv2.threshold(roi_b, thresh, 255, cv2.THRESH_BINARY_INV)
+#     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+#     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+#     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
 
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
-    if n <= 1:
-        return None
-    lbl = 0
-    if 0 <= ly < mask.shape[0] and 0 <= lx < mask.shape[1]:
-        lbl = int(labels[ly, lx])
-    if lbl == 0:                              # anchor not on a blob — take largest
-        lbl = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    mask = np.where(labels == lbl, 255, 0).astype(np.uint8)
-    return mask, x0, y0
-
-
-def _swirski_support(ellipse, pts, gx, gy):
-    """Score a candidate ellipse by image-aware support.
-
-    A contour point supports the ellipse if it lies within _SW_INLIER_DIST of
-    the ellipse boundary AND its local image gradient points outward (dark
-    pupil -> light iris) — Swirski's image-aware support term.  Boundary points
-    on the dark occluder patch have no such outward gradient, so they do not
-    support the fit, which is what makes this occlusion-tolerant.
-
-    Returns (inlier_count, inlier_mask).
-    """
-    (ex, ey), (MA, ma), ang = ellipse
-    a, b = MA / 2.0, ma / 2.0
-    if a < 1.0 or b < 1.0:
-        return 0, None
-
-    th = np.deg2rad(ang)
-    cos_t, sin_t = np.cos(th), np.sin(th)
-
-    dx = pts[:, 0] - ex
-    dy = pts[:, 1] - ey
-    xr = cos_t * dx + sin_t * dy
-    yr = -sin_t * dx + cos_t * dy
-    t = np.sqrt((xr / a) ** 2 + (yr / b) ** 2)   # 1.0 on the boundary
-
-    mean_r = (a + b) / 2.0
-    near = np.abs(t - 1.0) < (_SW_INLIER_DIST / mean_r)
-
-    ix = np.clip(pts[:, 0].astype(int), 0, gx.shape[1] - 1)
-    iy = np.clip(pts[:, 1].astype(int), 0, gx.shape[0] - 1)
-    g_dot = gx[iy, ix] * dx + gy[iy, ix] * dy
-
-    inliers = near & (g_dot > 0)
-    return int(inliers.sum()), inliers
+#     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+#     if n <= 1:
+#         return None
+#     lbl = 0
+#     if 0 <= ly < mask.shape[0] and 0 <= lx < mask.shape[1]:
+#         lbl = int(labels[ly, lx])
+#     if lbl == 0:                              # anchor not on a blob — take largest
+#         lbl = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+#     mask = np.where(labels == lbl, 255, 0).astype(np.uint8)
+#     return mask, x0, y0
 
 
-def _swirski_fit_ellipse(mask, gray_roi, iters):
-    """RANSAC ellipse fit with image-aware support (Swirski stage 3).
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _swirski_support(ellipse, pts, gx, gy):
+#     """Score a candidate ellipse by image-aware support.
 
-    Fits an ellipse to the pupil-mask boundary.  Each RANSAC hypothesis is built
-    from 5 random boundary points and scored by _swirski_support; the best
-    hypothesis is refined with a final fit to its inliers.
+#     A contour point supports the ellipse if it lies within _SW_INLIER_DIST of
+#     the ellipse boundary AND its local image gradient points outward (dark
+#     pupil -> light iris) — Swirski's image-aware support term.  Boundary points
+#     on the dark occluder patch have no such outward gradient, so they do not
+#     support the fit, which is what makes this occlusion-tolerant.
 
-    Returns an ellipse ((cx,cy),(MA,ma),angle) in ROI coordinates, or None.
-    """
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not cnts:
-        return None
-    pts = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
-    if len(pts) < 5:
-        return None
+#     Returns (inlier_count, inlier_mask).
+#     """
+#     (ex, ey), (MA, ma), ang = ellipse
+#     a, b = MA / 2.0, ma / 2.0
+#     if a < 1.0 or b < 1.0:
+#         return 0, None
 
-    gx = cv2.Sobel(gray_roi, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray_roi, cv2.CV_32F, 0, 1, ksize=3)
+#     th = np.deg2rad(ang)
+#     cos_t, sin_t = np.cos(th), np.sin(th)
 
-    n = len(pts)
-    rng = np.random.default_rng(0)
-    best_score = 0
-    best_inliers = None
-    for _ in range(iters):
-        idx = rng.choice(n, 5, replace=False)
-        try:
-            ell = cv2.fitEllipse(pts[idx])
-        except cv2.error:
-            continue
-        score, inliers = _swirski_support(ell, pts, gx, gy)
-        if score > best_score:
-            best_score = score
-            best_inliers = inliers
+#     dx = pts[:, 0] - ex
+#     dy = pts[:, 1] - ey
+#     xr = cos_t * dx + sin_t * dy
+#     yr = -sin_t * dx + cos_t * dy
+#     t = np.sqrt((xr / a) ** 2 + (yr / b) ** 2)   # 1.0 on the boundary
 
-    if best_inliers is None or int(best_inliers.sum()) < 5:
-        try:
-            return cv2.fitEllipse(pts)
-        except cv2.error:
-            return None
-    try:
-        return cv2.fitEllipse(pts[best_inliers])
-    except cv2.error:
-        return None
+#     mean_r = (a + b) / 2.0
+#     near = np.abs(t - 1.0) < (_SW_INLIER_DIST / mean_r)
+
+#     ix = np.clip(pts[:, 0].astype(int), 0, gx.shape[1] - 1)
+#     iy = np.clip(pts[:, 1].astype(int), 0, gx.shape[0] - 1)
+#     g_dot = gx[iy, ix] * dx + gy[iy, ix] * dy
+
+#     inliers = near & (g_dot > 0)
+#     return int(inliers.sum()), inliers
+
+
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _swirski_fit_ellipse(mask, gray_roi, iters):
+#     """RANSAC ellipse fit with image-aware support (Swirski stage 3).
+
+#     Fits an ellipse to the pupil-mask boundary.  Each RANSAC hypothesis is built
+#     from 5 random boundary points and scored by _swirski_support; the best
+#     hypothesis is refined with a final fit to its inliers.
+
+#     Returns an ellipse ((cx,cy),(MA,ma),angle) in ROI coordinates, or None.
+#     """
+#     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+#     if not cnts:
+#         return None
+#     pts = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+#     if len(pts) < 5:
+#         return None
+
+#     gx = cv2.Sobel(gray_roi, cv2.CV_32F, 1, 0, ksize=3)
+#     gy = cv2.Sobel(gray_roi, cv2.CV_32F, 0, 1, ksize=3)
+
+#     n = len(pts)
+#     rng = np.random.default_rng(0)
+#     best_score = 0
+#     best_inliers = None
+#     for _ in range(iters):
+#         idx = rng.choice(n, 5, replace=False)
+#         try:
+#             ell = cv2.fitEllipse(pts[idx])
+#         except cv2.error:
+#             continue
+#         score, inliers = _swirski_support(ell, pts, gx, gy)
+#         if score > best_score:
+#             best_score = score
+#             best_inliers = inliers
+
+#     if best_inliers is None or int(best_inliers.sum()) < 5:
+#         try:
+#             return cv2.fitEllipse(pts)
+#         except cv2.error:
+#             return None
+#     try:
+#         return cv2.fitEllipse(pts[best_inliers])
+#     except cv2.error:
+#         return None
 
 
 def _ray_ridges(gray, cx, cy, r_lo, r_hi, gx=None, gy=None, cover_mask=None):
@@ -1825,66 +1845,70 @@ def _points_from_radii(cx, cy, angles, radii):
     return np.stack([xs, ys], axis=1).astype(np.float32)
 
 
-def _refine_center(gray, cx, cy, rmin, rmax, iters):
-    """Recenter onto the pupil using opposing ray pairs (robust to occlusion).
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _refine_center(gray, cx, cy, rmin, rmax, iters):
+#     """Recenter onto the pupil using opposing ray pairs (robust to occlusion).
 
-    For each axis where BOTH opposite rays hit a pupil edge, the midpoint along
-    that axis estimates the centre; the median offset over all two-sided axes is
-    the recentre step.  One-sided axes (the occluded patch side, or the bright
-    glow running off one way) are skipped, so the estimate cannot run away the
-    way a full ellipse-fit recentre does.  Returns the refined (cx, cy).
-    """
-    half = _RAD_N_ANGLES // 2
-    for _ in range(iters):
-        angles, radii = _ray_edges(gray, cx, cy, rmin, rmax)
-        offs = []
-        for k in range(half):
-            rp, rn = radii[k], radii[k + half]
-            if not np.isnan(rp) and not np.isnan(rn):
-                shift = (rp - rn) / 2.0          # along +angles[k]
-                offs.append((shift * np.cos(angles[k]),
-                             shift * np.sin(angles[k])))
-        if not offs:
-            break
-        ox = float(np.median([o[0] for o in offs]))
-        oy = float(np.median([o[1] for o in offs]))
-        if abs(ox) < 1.5 and abs(oy) < 1.5:
-            break
-        cx = int(round(cx + ox))
-        cy = int(round(cy + oy))
-    return cx, cy
+#     For each axis where BOTH opposite rays hit a pupil edge, the midpoint along
+#     that axis estimates the centre; the median offset over all two-sided axes is
+#     the recentre step.  One-sided axes (the occluded patch side, or the bright
+#     glow running off one way) are skipped, so the estimate cannot run away the
+#     way a full ellipse-fit recentre does.  Returns the refined (cx, cy).
+#     """
+#     half = _RAD_N_ANGLES // 2
+#     for _ in range(iters):
+#         angles, radii = _ray_edges(gray, cx, cy, rmin, rmax)
+#         offs = []
+#         for k in range(half):
+#             rp, rn = radii[k], radii[k + half]
+#             if not np.isnan(rp) and not np.isnan(rn):
+#                 shift = (rp - rn) / 2.0          # along +angles[k]
+#                 offs.append((shift * np.cos(angles[k]),
+#                              shift * np.sin(angles[k])))
+#         if not offs:
+#             break
+#         ox = float(np.median([o[0] for o in offs]))
+#         oy = float(np.median([o[1] for o in offs]))
+#         if abs(ox) < 1.5 and abs(oy) < 1.5:
+#             break
+#         cx = int(round(cx + ox))
+#         cy = int(round(cy + oy))
+#     return cx, cy
 
 
-def _fit_ellipse_robust(pts):
-    """Least-squares ellipse fit to boundary points, with one outlier-rejecting
-    refit (drop points more than _RAD_INLIER_PX from the first fit).  Returns
-    ((cx,cy),(MA,ma),angle) or None."""
-    if len(pts) < 5:
-        return None
-    try:
-        ell = cv2.fitEllipse(pts.reshape(-1, 1, 2))
-    except cv2.error:
-        return None
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _fit_ellipse_robust(pts):
+#     """Least-squares ellipse fit to boundary points, with one outlier-rejecting
+#     refit (drop points more than _RAD_INLIER_PX from the first fit).  Returns
+#     ((cx,cy),(MA,ma),angle) or None."""
+#     if len(pts) < 5:
+#         return None
+#     try:
+#         ell = cv2.fitEllipse(pts.reshape(-1, 1, 2))
+#     except cv2.error:
+#         return None
 
-    (ex, ey), (MA, ma), ang = ell
-    a, b = MA / 2.0, ma / 2.0
-    if a < 1.0 or b < 1.0:
-        return ell
-    th = np.deg2rad(ang)
-    cos_t, sin_t = np.cos(th), np.sin(th)
-    dx = pts[:, 0] - ex
-    dy = pts[:, 1] - ey
-    xr = cos_t * dx + sin_t * dy
-    yr = -sin_t * dx + cos_t * dy
-    t = np.sqrt((xr / a) ** 2 + (yr / b) ** 2)
-    mean_r = (a + b) / 2.0
-    inl = np.abs(t - 1.0) * mean_r < _RAD_INLIER_PX
-    if int(inl.sum()) >= 5:
-        try:
-            return cv2.fitEllipse(pts[inl].reshape(-1, 1, 2))
-        except cv2.error:
-            return ell
-    return ell
+#     (ex, ey), (MA, ma), ang = ell
+#     a, b = MA / 2.0, ma / 2.0
+#     if a < 1.0 or b < 1.0:
+#         return ell
+#     th = np.deg2rad(ang)
+#     cos_t, sin_t = np.cos(th), np.sin(th)
+#     dx = pts[:, 0] - ex
+#     dy = pts[:, 1] - ey
+#     xr = cos_t * dx + sin_t * dy
+#     yr = -sin_t * dx + cos_t * dy
+#     t = np.sqrt((xr / a) ** 2 + (yr / b) ** 2)
+#     mean_r = (a + b) / 2.0
+#     inl = np.abs(t - 1.0) * mean_r < _RAD_INLIER_PX
+#     if int(inl.sum()) >= 5:
+#         try:
+#             return cv2.fitEllipse(pts[inl].reshape(-1, 1, 2))
+#         except cv2.error:
+#             return ell
+#     return ell
 
 
 def _fit_circle(pts):
@@ -4059,6 +4083,82 @@ class GazeScan(LitStage):
 LOCAL_SESSION_DIR = "/tmp/eyevu_sessions"
 SESSION_MIN_FOR_MOSAIC = 2       # takes needed before a mosaic can be built
 
+# ── patient ──
+# One patient has MANY sessions: each alignment run is a session, and a patient
+# may be scanned several times in a sitting or across visits.  Which matters
+# because sessions of the same eye combine well — measured on two real
+# sessions that placed 5 and 6 captures on their own, 20 of 22 combined — so
+# knowing which sessions belong together is what makes that safe to do
+# automatically.  Combining sessions from DIFFERENT patients would be a
+# clinical error, which is the whole reason this identifier exists.
+#
+# Recorded into each session folder as session.json.  Sessions written before
+# this existed have no such file and are all the same patient, so a missing
+# record reads as patient "0" — see `session_patient`.
+PATIENT_ID = str(os.environ.get("EYEVU_PATIENT", "0"))
+
+
+def set_patient(pid):
+    """Set the patient every SUBSEQUENT session is filed under."""
+    global PATIENT_ID
+    PATIENT_ID = str(pid).strip() or "0"
+    print(f"[PATIENT] now filing sessions under patient {PATIENT_ID}")
+    return PATIENT_ID
+
+
+def session_patient(d):
+    """Patient a session folder belongs to; "0" when it predates the field."""
+    p = os.path.join(d, "session.json")
+    if os.path.isfile(p):
+        try:
+            with open(p, encoding="utf-8") as fh:
+                return str(json.load(fh).get("patient", "0"))
+        except (OSError, ValueError):
+            pass
+    return "0"
+
+
+def write_session_meta(session):
+    """Stamp a session folder with its patient.  Idempotent, never raises."""
+    d = session_dir(session)
+    p = os.path.join(d, "session.json")
+    try:
+        os.makedirs(d, exist_ok=True)
+        if os.path.isfile(p):
+            return p
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"patient": PATIENT_ID, "session": session,
+                       "created": datetime.now().isoformat(timespec="seconds")},
+                      fh, indent=2)
+    except OSError as e:                             # noqa: BLE001
+        print(f"[SESSION] could not stamp {p}: {e}")
+        return None
+    return p
+
+
+def sessions_for_patient(pid=None, root=None):
+    """Every session folder belonging to a patient, oldest first.
+
+    Used to mosaic a whole patient at once rather than one sitting at a time.
+    """
+    pid = str(PATIENT_ID if pid is None else pid)
+    root = root or LOCAL_SESSION_DIR
+    if not os.path.isdir(root):
+        return []
+    out = []
+    for name in sorted(os.listdir(root)):
+        d = os.path.join(root, name)
+        if not os.path.isdir(d) or not name.startswith("session_"):
+            continue
+        try:
+            has_captures = any(f.startswith("redeye_") and f.endswith("_extract.png")
+                               for f in os.listdir(d))
+        except OSError:
+            continue
+        if has_captures and session_patient(d) == pid:
+            out.append(d)
+    return out
+
 
 def session_dir(session):
     """Local directory holding one session's red-eye extracts."""
@@ -4098,6 +4198,7 @@ def save_session_frame(session, extract, mask):
     d = session_dir(session)
     try:
         os.makedirs(d, exist_ok=True)
+        write_session_meta(session)      # stamp the patient on the first save
         idx = len(session_shots(session)) + 1
         stamp = datetime.now().strftime("%H%M%S")
         base = os.path.join(d, f"redeye_{idx:02d}_{stamp}")
@@ -4123,21 +4224,214 @@ def save_session_frame(session, extract, mask):
 def build_session_mosaic(session, show=True):
     """Stitch this session's red-eye extracts.  Returns (mosaic, info) or (None, {}).
 
-    Runs the shared mosaic.py, so the Pi and the dev machine produce the same
-    result from the same inputs.
+    Runs `eyevu_mosaic`, so the Pi and the dev machine produce the same result
+    from the same inputs.  Falls back to the old mosaic.py if that package will
+    not import — most plausibly because scipy or scikit-image is missing, since
+    the Pi installer's pip block for them is commented out.  A degraded mosaic
+    beats no mosaic in the middle of a session.
+
+    ONE window is shown, not several: the operator is mid-session on a small
+    screen and wants the result, not the workings.  `try_mosaic.py` on the dev
+    machine is where the intermediates live.
     """
-    try:
-        import mosaic
-    except ImportError as e:                         # noqa: BLE001
-        print(f"[MOSAIC] unavailable: {e}")
-        return None, {}
     d = session_dir(session)
     shots = session_shots(session)
     if len(shots) < SESSION_MIN_FOR_MOSAIC:
         print(f"[MOSAIC] need at least {SESSION_MIN_FOR_MOSAIC} captures, "
               f"have {len(shots)}.")
         return None, {}
-    print(f"[MOSAIC] stitching {len(shots)} red-eye extract(s) from session {session}...")
+
+    try:
+        from eyevu_mosaic.config import MosaicConfig
+        from eyevu_mosaic.run_session import run as _run_mosaic
+    except ImportError as e:                         # noqa: BLE001
+        print(f"[MOSAIC] eyevu_mosaic unavailable ({e}); using legacy mosaic.py")
+        return _legacy_session_mosaic(session, show)
+
+    print(f"[MOSAIC] stitching {len(shots)} red-eye extract(s) from "
+          f"session {session}...")
+    out_dir = os.path.join(d, "bundle")
+    try:
+        res = _run_mosaic(d, out_dir, MosaicConfig(), verbose=True)
+    except Exception as e:                           # noqa: BLE001
+        # run() is already fail-soft; this is the belt-and-braces layer, because
+        # nothing here may take the live session down with it.
+        print(f"[MOSAIC] failed: {e!r}; using legacy mosaic.py")
+        return _legacy_session_mosaic(session, show)
+
+    comps = res.get("components") or []
+    if not res.get("ok"):
+        print(f"[MOSAIC] no mosaic produced"
+              + (f" - {res['error'].strip().splitlines()[-1]}" if res.get("error")
+                 else " - no reliable alignment between the captures."))
+        return None, res
+    print(f"[MOSAIC] {max(len(c) for c in comps)}/{len(shots)} captures placed"
+          + (f"; {len(comps)} disconnected group(s) {[len(c) for c in comps]}"
+             if len(comps) > 1 else "")
+          + f"; bundle {out_dir}")
+
+    mos = cv2.imread(os.path.join(out_dir, "mosaic.png"), cv2.IMREAD_COLOR) \
+        if CV2_AVAILABLE else None
+    if show and CV2_AVAILABLE and mos is not None:
+        view_session_mosaic(out_dir)
+    if TRANSFER_ENABLED and mos is not None:
+        try:
+            ok, buf = cv2.imencode(".png", mos)
+            if ok:
+                _post_to_receiver(f"session_{session}", "mosaic.png", buf.tobytes())
+        except cv2.error:
+            pass
+    return mos, res
+
+
+def build_patient_mosaic(pid=None, show=True):
+    """Mosaic EVERY session of one patient together.  Returns (mosaic, info).
+
+    Worth doing rather than a nicety: a single sitting frequently fragments into
+    disconnected groups, and another sitting of the same eye often bridges them,
+    because the pipeline treats every pair independently and has no temporal
+    assumption to violate.  Measured on two real sessions that placed 5 and 6
+    captures separately: 20 of 22 combined, with 17 of the 37 accepted pairs
+    joining the two sittings.
+
+    Only sessions filed under the SAME patient are combined — mixing patients
+    would be a clinical error, which is what `PATIENT_ID` exists to prevent.
+    """
+    pid = str(PATIENT_ID if pid is None else pid)
+    dirs = sessions_for_patient(pid)
+    if not dirs:
+        print(f"[MOSAIC] no sessions found for patient {pid}.")
+        return None, {}
+    n = sum(1 for d in dirs
+            for f in os.listdir(d)
+            if f.startswith("redeye_") and f.endswith("_extract.png"))
+    if n < SESSION_MIN_FOR_MOSAIC:
+        print(f"[MOSAIC] patient {pid} has {n} capture(s); "
+              f"need {SESSION_MIN_FOR_MOSAIC}.")
+        return None, {}
+
+    try:
+        from eyevu_mosaic.config import MosaicConfig
+        from eyevu_mosaic.run_session import run as _run_mosaic
+    except ImportError as e:                         # noqa: BLE001
+        print(f"[MOSAIC] eyevu_mosaic unavailable ({e}); "
+              f"cannot combine sessions. Use 'o' for one session.")
+        return None, {}
+
+    print(f"[MOSAIC] patient {pid}: {n} capture(s) across {len(dirs)} "
+          f"session(s): {', '.join(os.path.basename(d) for d in dirs)}")
+    out_dir = os.path.join(LOCAL_SESSION_DIR, f"patient_{pid}_mosaic")
+    try:
+        res = _run_mosaic(dirs, out_dir, MosaicConfig(), verbose=True,
+                          session_id=f"patient_{pid}")
+    except Exception as e:                           # noqa: BLE001
+        print(f"[MOSAIC] failed: {e!r}")
+        return None, {}
+
+    comps = res.get("components") or []
+    if not res.get("ok"):
+        print("[MOSAIC] no mosaic produced for this patient.")
+        return None, res
+    print(f"[MOSAIC] {max(len(c) for c in comps)}/{n} captures placed"
+          + (f"; {len(comps)} disconnected group(s) {[len(c) for c in comps]}"
+             if len(comps) > 1 else "")
+          + f"; bundle {out_dir}")
+    mos = cv2.imread(os.path.join(out_dir, "mosaic.png"), cv2.IMREAD_COLOR) \
+        if CV2_AVAILABLE else None
+    if show and CV2_AVAILABLE and mos is not None:
+        view_session_mosaic(out_dir, window=f"Patient {pid} mosaic")
+    if TRANSFER_ENABLED and mos is not None:
+        try:
+            ok, buf = cv2.imencode(".png", mos)
+            if ok:
+                _post_to_receiver(f"patient_{pid}", "mosaic.png", buf.tobytes())
+        except cv2.error:
+            pass
+    return mos, res
+
+
+def view_session_mosaic(out_dir, window="Red-eye mosaic"):
+    """Show the finished mosaic in ONE window, and block until dismissed.
+
+        b            outline each contributing capture, in its own colour,
+                     labelled with its index
+        n / SPACE    next group, when the session did not fully connect
+        ESC / q      close
+
+    The boundary overlay is the quickest way to see WHICH capture went where:
+    a patch stacked on a neighbour, or one hanging off the edge on a single
+    weak link, is obvious in the outlines and invisible in the blended result.
+    """
+    if not CV2_AVAILABLE:
+        return False
+
+    def _load(base):
+        # Existence is checked before imread: probing for the group after the
+        # last one is how the loop terminates, and imread on a missing file
+        # prints an OpenCV warning that looks like a fault and is not one.
+        p = os.path.join(out_dir, f"{base}.png")
+        if not os.path.isfile(p):
+            return None
+        plain = cv2.imread(p, cv2.IMREAD_COLOR)
+        if plain is None:
+            return None
+        po = os.path.join(out_dir, f"{base}_outlined.png")
+        over = cv2.imread(po, cv2.IMREAD_COLOR) if os.path.isfile(po) else None
+        return [plain] + ([over] if over is not None else [])
+
+    groups = [g for g in [_load("mosaic")] if g]
+    ci = 1
+    while True:
+        g = _load(f"mosaic_component_{ci}")
+        if g is None:
+            break
+        groups.append(g)
+        ci += 1
+    if not groups:
+        return False
+
+    gi, variant = 0, 0
+    print(f"  mosaic viewer: b = patch boundaries"
+          + (f", n = next group (of {len(groups)})" if len(groups) > 1 else "")
+          + ", ESC/q = close")
+    try:
+        while True:
+            variants = groups[gi]
+            vis = variants[min(variant, len(variants) - 1)].copy()
+            label = (f"group {gi + 1}/{len(groups)}" if len(groups) > 1 else "")
+            if variant and len(variants) > 1:
+                label = (label + "  outlines").strip()
+            if vis.shape[0] > 720:
+                s = 720.0 / vis.shape[0]
+                vis = cv2.resize(vis, (int(vis.shape[1] * s), 720))
+            if label:
+                for col, th in (((0, 0, 0), 3), ((255, 255, 255), 1)):
+                    cv2.putText(vis, label, (10, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.55, col, th, cv2.LINE_AA)
+            cv2.imshow(window, vis)
+            k = cv2.waitKeyEx(0) & 0xFF
+            if k in (27, ord('q')):
+                break
+            if k == ord('b'):
+                variant = 1 - variant
+            elif k in (ord('n'), 32) and len(groups) > 1:
+                gi = (gi + 1) % len(groups)
+    finally:
+        try:
+            cv2.destroyWindow(window)
+        except cv2.error:
+            pass
+    return True
+
+
+def _legacy_session_mosaic(session, show=True):
+    """The previous mosaic.py path, kept as a fallback only."""
+    try:
+        import mosaic
+    except ImportError as e:                         # noqa: BLE001
+        print(f"[MOSAIC] unavailable: {e}")
+        return None, {}
+    d = session_dir(session)
     out = os.path.join(d, "mosaic.png")
     mos, info, paths = mosaic.build(d, out)
     if mos is None:
@@ -4190,13 +4484,18 @@ def browse_session_shots(session, window="Session captures"):
     try:
         while True:
             src = imgs[i]
+            # Crop to the illuminated content and zoom.  The extract is a ~45x32
+            # px blob in a 480x640 frame -- 0.28% of it -- so shown whole this
+            # was a black screen with a speck in the middle.  Extract and mask
+            # share one box so `m` toggles in place instead of jumping.
+            m_i = masks[i] if masks[i] is not None else mosaic.mask_for(src)
+            box = mosaic.patch_view_box(m_i, src.shape)
             if show_mask and masks[i] is not None:
-                vis = cv2.cvtColor(masks[i], cv2.COLOR_GRAY2BGR)
+                vis = cv2.cvtColor(mosaic.crop_box(masks[i], box),
+                                   cv2.COLOR_GRAY2BGR)
             else:
-                vis = src.copy()
-            if vis.shape[0] > 900:                   # only shrink if it must
-                s = 900.0 / vis.shape[0]
-                vis = cv2.resize(vis, (int(vis.shape[1] * s), 900))
+                vis = mosaic.crop_box(src, box).copy()
+            vis = mosaic.fit_for_display(vis)
             px = int(cv2.countNonZero(masks[i])) if masks[i] is not None else -1
             label = (f"[{i + 1}/{len(imgs)}] "
                      f"{os.path.basename(paths[i]).replace('_extract.png', '')}"
@@ -4256,31 +4555,36 @@ def show_session_keypoints(session):
     return True
 
 
-def show_session_shots(session):
-    """Open a contact sheet of this session's constituent extracts."""
-    try:
-        import mosaic
-    except ImportError as e:                         # noqa: BLE001
-        print(f"[MOSAIC] unavailable: {e}")
-        return False
-    imgs, _, paths = mosaic.load_session(session_dir(session))
-    if not imgs:
-        print(f"[MOSAIC] session {session} has no captures yet.")
-        return False
-    sheet = mosaic.contact_sheet(
-        imgs, labels=[os.path.basename(p).replace("_extract.png", "")
-                      for p in paths])
-    if sheet is None:
-        return False
-    if CV2_AVAILABLE:
-        if sheet.shape[0] > 800:
-            s = 800.0 / sheet.shape[0]
-            sheet = cv2.resize(sheet, (int(sheet.shape[1] * s), 800))
-        cv2.imshow("Session captures", sheet)
-        cv2.waitKey(1)
-    print(f"[MOSAIC] session {session}: {len(imgs)} capture(s) - "
-          + ", ".join(os.path.basename(p) for p in paths))
-    return True
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def show_session_shots(session):
+#     """Open a contact sheet of this session's constituent extracts."""
+#     try:
+#         import mosaic
+#     except ImportError as e:                         # noqa: BLE001
+#         print(f"[MOSAIC] unavailable: {e}")
+#         return False
+#     imgs, masks, paths = mosaic.load_session(session_dir(session))
+#     if not imgs:
+#         print(f"[MOSAIC] session {session} has no captures yet.")
+#         return False
+#     # Pass the saved masks: they are the capture's own selection, which is a
+#     # better crop guide than "whatever is not black" in the extract.
+#     sheet = mosaic.contact_sheet(
+#         imgs, masks=masks,
+#         labels=[os.path.basename(p).replace("_extract.png", "")
+#                 for p in paths])
+#     if sheet is None:
+#         return False
+#     if CV2_AVAILABLE:
+#         if sheet.shape[0] > 800:
+#             s = 800.0 / sheet.shape[0]
+#             sheet = cv2.resize(sheet, (int(sheet.shape[1] * s), 800))
+#         cv2.imshow("Session captures", sheet)
+#         cv2.waitKey(1)
+#     print(f"[MOSAIC] session {session}: {len(imgs)} capture(s) - "
+#           + ", ".join(os.path.basename(p) for p in paths))
+#     return True
 
 
 def _post_to_receiver(folder, filename, data):
@@ -4619,27 +4923,29 @@ def capture_flash_pair(picam2, live_center_frac=None, live_radius_frac=None,
     print("Captured (flash + dark).")
 
 
-def _draw_detections(vis, ridge, ritnet, category):
-    """Overlay BOTH detectors on the guidance image: ridge (traditional) in cyan,
-    RITnet (NN) in magenta, plus a legend with the category."""
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    h = vis.shape[0]
-    if ridge is not None:
-        (rx, ry), rr = ridge[0], ridge[1]
-        cv2.circle(vis, (int(rx), int(ry)), max(3, int(rr)), (255, 255, 0), 2)  # cyan
-        cv2.putText(vis, f"ridge {ridge[2]:.2f}",
-                    (int(rx) - 36, int(ry) - max(3, int(rr)) - 6),
-                    font, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
-    if ritnet is not None:
-        (nx, ny), nr = ritnet[0], (ritnet[1] or 8)
-        cv2.circle(vis, (int(nx), int(ny)), max(3, int(nr)), (255, 0, 255), 2)  # magenta
-        cv2.putText(vis, f"nn {ritnet[2]:.2f}",
-                    (int(nx) - 24, int(ny) + max(3, int(nr)) + 16),
-                    font, 0.5, (255, 0, 255), 1, cv2.LINE_AA)
-    legend = f"[{category}]  cyan=ridge  magenta=nn"
-    cv2.putText(vis, legend, (10, h - 12), font, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(vis, legend, (10, h - 12), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-    return vis
+# DEAD CODE - no caller anywhere in the repo (AST reachability scan, 2026-08-19).
+# Commented out, not deleted.  See docs/REPO_MAP.md section 5.1.
+# def _draw_detections(vis, ridge, ritnet, category):
+#     """Overlay BOTH detectors on the guidance image: ridge (traditional) in cyan,
+#     RITnet (NN) in magenta, plus a legend with the category."""
+#     font = cv2.FONT_HERSHEY_SIMPLEX
+#     h = vis.shape[0]
+#     if ridge is not None:
+#         (rx, ry), rr = ridge[0], ridge[1]
+#         cv2.circle(vis, (int(rx), int(ry)), max(3, int(rr)), (255, 255, 0), 2)  # cyan
+#         cv2.putText(vis, f"ridge {ridge[2]:.2f}",
+#                     (int(rx) - 36, int(ry) - max(3, int(rr)) - 6),
+#                     font, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
+#     if ritnet is not None:
+#         (nx, ny), nr = ritnet[0], (ritnet[1] or 8)
+#         cv2.circle(vis, (int(nx), int(ny)), max(3, int(nr)), (255, 0, 255), 2)  # magenta
+#         cv2.putText(vis, f"nn {ritnet[2]:.2f}",
+#                     (int(nx) - 24, int(ny) + max(3, int(nr)) + 16),
+#                     font, 0.5, (255, 0, 255), 1, cv2.LINE_AA)
+#     legend = f"[{category}]  cyan=ridge  magenta=nn"
+#     cv2.putText(vis, legend, (10, h - 12), font, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+#     cv2.putText(vis, legend, (10, h - 12), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+#     return vis
 
 
 def _redeye_capture(ambient_array, flash_array, dark_array=None,
@@ -5531,23 +5837,61 @@ def streaming_mode(picam2):
                       f"{'HIDDEN (guidance only)' if image_hidden else 'SHOWN'}")
 
             # o PAUSES the live feed and mosaics this session's red-eye extracts.
-            # Stitching is slow (feature detection on several frames), hence the
-            # pause: the LEDs go off and nothing else runs until it is done.
+            # Stitching is slow, hence the pause: the LEDs go off and nothing
+            # else runs until it is done.
+            #
+            # It is now SLOW ENOUGH TO PLAN AROUND.  The pipeline attempts every
+            # pair, and where descriptors fail it falls back to a direct
+            # photometric search — which is what raised the share of captures
+            # placed from ~21% to ~49%, but costs roughly a second per capture
+            # per capture.  Measured on the dev laptop: 8 s for 12 captures,
+            # 47 s for 40.  Expect several minutes on the Pi for a long session.
+            # Do it between patients, not while one is at the scope.
             elif key == ord('o'):
                 n = len(session_shots(_session))
                 if n < SESSION_MIN_FOR_MOSAIC:
                     print(f"[MOSAIC] session {_session} has {n} capture(s); "
                           f"need {SESSION_MIN_FOR_MOSAIC}.")
                 else:
-                    print(f"--- live feed PAUSED: mosaicing {n} capture(s) ---")
+                    print(f"--- live feed PAUSED: mosaicing {n} capture(s) "
+                          f"(minutes, not seconds - see the note at this key) ---")
                     was_flash, was_amb = led_on, ambient_led_on
                     flash_off(); ambient_off(); led_on = False
-                    cv2.putText(disp, "MOSAICING - paused", (10, disp.shape[0] // 2),
+                    cv2.putText(disp, f"MOSAICING {n} captures - paused",
+                                (10, disp.shape[0] // 2),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                     cv2.imshow(WINDOW_NAME, disp); cv2.waitKey(1)
+                    # One window, and it blocks until dismissed: the result with
+                    # a boundary toggle, not the workings.  'x' still shows the
+                    # keypoints and 'v' still browses the captures.
                     build_session_mosaic(_session)
-                    show_session_shots(_session)
                     print("--- live feed RESUMED (any window stays open) ---")
+                    if was_amb:
+                        ambient_on()
+                    if was_flash:
+                        flash_on(); led_on = True
+                    apply_camera_settings(picam2, FLASH_GAIN)
+                    _live_dark = None       # lighting was disturbed; re-reference
+
+            # O (shift-o) mosaics EVERY session of the current patient together.
+            # Different sittings of the same eye often bridge each other's gaps:
+            # measured on two real sessions that placed 5 and 6 captures alone,
+            # 20 of 22 combined.  Slower than 'o' in proportion to the captures.
+            elif key == ord('O'):
+                dirs = sessions_for_patient()
+                if not dirs:
+                    print(f"[MOSAIC] no sessions for patient {PATIENT_ID}.")
+                else:
+                    print(f"--- live feed PAUSED: mosaicing patient "
+                          f"{PATIENT_ID} across {len(dirs)} session(s) ---")
+                    was_flash, was_amb = led_on, ambient_led_on
+                    flash_off(); ambient_off(); led_on = False
+                    cv2.putText(disp, f"MOSAICING patient {PATIENT_ID} - paused",
+                                (10, disp.shape[0] // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    cv2.imshow(WINDOW_NAME, disp); cv2.waitKey(1)
+                    build_patient_mosaic()
+                    print("--- live feed RESUMED ---")
                     if was_amb:
                         ambient_on()
                     if was_flash:
