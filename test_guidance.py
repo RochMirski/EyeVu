@@ -146,6 +146,110 @@ def test_camera_hint_hold_steady_when_on_anchor():
     assert "hold steady" in h, h
 
 
+# ── overshoot recovery ──
+# Driving the pupil PAST the cover leaves the approach with no reflex to find, so
+# the instruction has to reverse.  It must be the exact opposite of the approach
+# move, or the operator is sent further into the failure they are already in.
+
+def test_back_off_is_the_reverse_of_the_approach():
+    for side in ("top", "bottom"):
+        assert guidance._back_off_word(side) != guidance._close_word(side), side
+
+
+def test_back_off_hint_top_cover_says_up():
+    # Top cover: the approach moves the camera DOWN, so backing off is UP.
+    h = guidance.back_off_hint("top")
+    assert "up" in h and "down" not in h, h
+
+
+def test_back_off_hint_bottom_cover_says_down():
+    h = guidance.back_off_hint("bottom")
+    assert "down" in h and "up" not in h, h
+
+
+def test_back_off_arrow_agrees_with_words():
+    for side in ("top", "bottom"):
+        words = guidance.back_off_hint(side)
+        vec = guidance.back_off_vector(side, (1000, 600))
+        assert ("down" in words) == (vec[1] > 0), (side, words, vec)
+
+
+def test_back_off_arrow_opposes_the_approach_arrow():
+    for side in ("top", "bottom"):
+        fwd = guidance.camera_arrow((300, 500), (300, 500), (1000, 600),
+                                    close_to=side)
+        back = guidance.back_off_vector(side, (1000, 600))
+        assert fwd[1] * back[1] < 0, (side, fwd, back)
+
+
+# ── reversing the approach ──
+# The reflex has a sweet spot in the cover/pupil gap and the pupil looks fine on
+# both sides of it, so "keep closing" can be an instruction to walk away from the
+# only place the reflex exists.  The vertical half has to be reversible.
+
+def test_vertical_word_reverses():
+    for side in ("top", "bottom"):
+        assert (guidance._vertical_word(side, reverse=True)
+                != guidance._vertical_word(side, reverse=False))
+        assert guidance._vertical_word(side, False) == guidance._close_word(side)
+
+
+def test_camera_hint_reverse_flips_the_vertical():
+    fwd = guidance.camera_hint((300, 500), (300, 500), (1000, 600), close_to="top")
+    rev = guidance.camera_hint((300, 500), (300, 500), (1000, 600), close_to="top",
+                               reverse=True)
+    assert "down" in fwd and "up" in rev, (fwd, rev)
+
+
+def test_camera_arrow_reverse_flips_the_vertical():
+    for side in ("top", "bottom"):
+        fwd = guidance.camera_arrow((300, 500), (300, 500), (1000, 600),
+                                    close_to=side)
+        rev = guidance.camera_arrow((300, 500), (300, 500), (1000, 600),
+                                    close_to=side, reverse=True)
+        assert fwd[1] * rev[1] < 0, (side, fwd, rev)
+
+
+def test_reversed_words_and_arrow_still_agree():
+    for side in ("top", "bottom"):
+        words = guidance.camera_hint((300, 500), (300, 500), (1000, 600),
+                                     close_to=side, reverse=True)
+        vec = guidance.camera_arrow((300, 500), (300, 500), (1000, 600),
+                                    close_to=side, reverse=True)
+        assert ("down" in words) == (vec[1] > 0), (side, words, vec)
+
+
+def test_reverse_keeps_the_lateral_correction():
+    # Reversing is a VERTICAL decision; sideways drift is still corrected.
+    h = guidance.camera_hint((400, 500), (300, 500), (1000, 600), close_to="top",
+                             reverse=True)
+    assert "up" in h and "right" in h, h
+
+
+# ── the readout drawn beside the fixation target ──
+
+def test_annotate_draws_the_readout():
+    frame = np.zeros((640, 480, 3), np.uint8)
+    g = guidance.Guidance(state="approach", instruction=guidance.INSTRUCTION_LOOK,
+                          hint="Camera: move up", readout="red 300 / 650 px")
+    plain = guidance.annotate(frame, guidance.Guidance(
+        state="approach", instruction=guidance.INSTRUCTION_LOOK,
+        hint="Camera: move up"), (240, 320), (100, 100), fixation=True)
+    with_read = guidance.annotate(frame, g, (240, 320), (100, 100), fixation=True)
+    assert not np.array_equal(plain, with_read), "readout was not drawn"
+
+
+def test_annotate_readout_is_green_when_met():
+    frame = np.zeros((640, 480, 3), np.uint8)
+    args = dict(state="approach", instruction=guidance.INSTRUCTION_LOOK,
+                readout="red 900 / 650 px")
+    unmet = guidance.annotate(frame, guidance.Guidance(**args, readout_ok=False),
+                              (240, 320), None, fixation=True)
+    met = guidance.annotate(frame, guidance.Guidance(**args, readout_ok=True),
+                            (240, 320), None, fixation=True)
+    assert not np.array_equal(unmet, met), "met/unmet readouts look identical"
+
+
 def test_annotate_runs():
     frame = np.zeros((640, 480, 3), np.uint8)
     t = guidance.GuidanceTracker()

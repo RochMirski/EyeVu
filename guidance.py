@@ -92,7 +92,27 @@ def _close_word(cover_side):
     return "down" if str(cover_side).lower().startswith("t") else "up"
 
 
-def camera_hint(pupil_center, anchor, frame_shape, close_to=None, settled=False):
+def _back_off_word(cover_side):
+    """Camera direction that UNDOES the approach — the exact reverse of closing."""
+    return "up" if _close_word(cover_side) == "down" else "down"
+
+
+def _vertical_word(cover_side, reverse=False):
+    """The approach's vertical direction: closing on the cover, or backing off it.
+
+    The approach is not a one-way push.  The red reflex has a sweet spot in the
+    cover/pupil gap — too far away and it has not appeared, too far past and it is
+    gone again — and the pupil stays perfectly visible on both sides of it, so
+    "keep closing" can easily be an instruction to walk further away from the only
+    place the reflex exists.  Reversing has to be sayable.
+
+    Both the words and the arrow come through here, so they cannot disagree.
+    """
+    return _back_off_word(cover_side) if reverse else _close_word(cover_side)
+
+
+def camera_hint(pupil_center, anchor, frame_shape, close_to=None, settled=False,
+                reverse=False):
     """What the OPERATOR should do with the scope, in one short line.
 
     Same sign convention as the movement instructions above: the word names the
@@ -100,7 +120,9 @@ def camera_hint(pupil_center, anchor, frame_shape, close_to=None, settled=False)
 
     `close_to` ("top"/"bottom") switches the vertical half into approach mode —
     keep closing on that edge rather than holding a position — while the
-    horizontal half still corrects sideways drift.
+    horizontal half still corrects sideways drift.  `reverse` flips that vertical
+    half to back OFF the cover instead, for when the reflex has been overshot; the
+    lateral correction is unaffected either way.
 
     `settled` applies the hysteresis: once the operator has been told to hold
     steady, only a LARGE drift earns another instruction.
@@ -113,7 +135,7 @@ def camera_hint(pupil_center, anchor, frame_shape, close_to=None, settled=False)
     dy = float(pupil_center[1] - anchor[1])
     parts = []
     if close_to:
-        parts.append(_close_word(close_to))
+        parts.append(_vertical_word(close_to, reverse))
     else:
         v = _axis_word(dy, "down", "up", dead)
         if v:
@@ -135,7 +157,8 @@ CAMERA_ARROW_FRAC = 0.16
 CAMERA_ARROW_REF_FRAC = 0.15
 
 
-def camera_arrow(pupil_center, anchor, frame_shape, close_to=None, settled=False):
+def camera_arrow(pupil_center, anchor, frame_shape, close_to=None, settled=False,
+                 reverse=False):
     """(dx, dy) px the camera centre should move — the arrow drawn from centre.
 
     Matches `camera_hint` exactly, so the words and the arrow can never disagree:
@@ -158,8 +181,9 @@ def camera_arrow(pupil_center, anchor, frame_shape, close_to=None, settled=False
     dy = float(pupil_center[1] - anchor[1])
     if close_to:
         # Screen y grows downward, so "down" is +1.  Derived from the same
-        # _close_word as the text, so arrow and words cannot drift apart.
-        vy = 1.0 if _close_word(close_to) == "down" else -1.0
+        # _vertical_word as the text, so arrow and words cannot drift apart —
+        # including when the approach reverses to back off an overshot reflex.
+        vy = 1.0 if _vertical_word(close_to, reverse) == "down" else -1.0
         ref = CAMERA_ARROW_REF_FRAC * scale
         vx = 0.0 if abs(dx) <= dead else max(-1.0, min(1.0, dx / ref))
     else:
@@ -170,6 +194,23 @@ def camera_arrow(pupil_center, anchor, frame_shape, close_to=None, settled=False
     n = float(np.hypot(vx, vy))
     reach = CAMERA_ARROW_FRAC * scale
     return (vx / n * reach, vy / n * reach)
+
+
+def back_off_hint(cover_side):
+    """Operator instruction for an overshot approach.
+
+    Says what went wrong as well as what to do: the operator has been pushing in
+    one direction on the strength of a red count that never arrived, so an
+    unexplained reversal reads as the guidance dithering.
+    """
+    return f"Camera: LOST THE PUPIL - move {_back_off_word(cover_side)}, gone too far"
+
+
+def back_off_vector(cover_side, frame_shape):
+    """The back-off instruction as an arrow, matching `back_off_hint` exactly."""
+    h, w = frame_shape[:2]
+    reach = CAMERA_ARROW_FRAC * float(min(h, w))
+    return (0.0, reach if _back_off_word(cover_side) == "down" else -reach)
 
 
 def cover_edge_word(cover_side):
@@ -270,6 +311,12 @@ class Guidance:
                                       # patient instruction in the side block
     hint_vector: Optional[tuple] = None  # (dx, dy) px the CAMERA CENTRE should move;
                                       # drawn as an arrow from the frame centre
+    readout: str = ""                 # the measurement being worked to (red pixels
+                                      # against the requirement), shown beside the
+                                      # fixation target with the instructions —
+                                      # the operator is looking THERE, not at the
+                                      # status line in the corner
+    readout_ok: bool = False          # requirement met -> draw the readout green
 
 
 def _axis_word(value, positive, negative, dead):
@@ -488,9 +535,17 @@ def annotate(frame_bgr, guidance: Guidance, target, pupil_center=None,
         # just off-centre, where they sit in peripheral vision — the patient's
         # instruction and, under it, the camera move the operator needs to make.
         # Placed to the right unless that would overflow, then flipped to the left.
-        lines = [guidance.instruction] + ([guidance.hint] if guidance.hint else [])
+        # Patient instruction, then the operator's camera move, then the number
+        # they are working to.  All three sit by the fixation point rather than in
+        # the corner: that is where both pairs of eyes already are.
+        lines = [(guidance.instruction, (255, 255, 255))]
+        if guidance.hint:
+            lines.append((guidance.hint, (0, 255, 255)))          # amber
+        if guidance.readout:
+            lines.append((guidance.readout,
+                          (0, 255, 0) if guidance.readout_ok else (0, 255, 255)))
         widths = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX,
-                                  SIDE_FONT_SCALE, 1)[0][0] for t in lines]
+                                  SIDE_FONT_SCALE, 1)[0][0] for t, _ in lines]
         block_w = max(widths)
         gap = int(SIDE_GAP_FRAC * min(h, w))
         ix = w // 2 + gap
@@ -498,9 +553,8 @@ def annotate(frame_bgr, guidance: Guidance, target, pupil_center=None,
             ix = w // 2 - gap - block_w
         ix = max(6, min(ix, w - block_w - 6))
         iy = h // 2 - (len(lines) - 1) * SIDE_LINE_PX // 2 + 5
-        for n, text in enumerate(lines):
+        for n, (text, tone) in enumerate(lines):
             y = iy + n * SIDE_LINE_PX
-            tone = (255, 255, 255) if n == 0 else (0, 255, 255)   # hint in amber
             for col, thick in (((0, 0, 0), 3), (tone, 1)):
                 cv2.putText(img, text, (ix, y), cv2.FONT_HERSHEY_SIMPLEX,
                             SIDE_FONT_SCALE, col, thick, cv2.LINE_AA)
